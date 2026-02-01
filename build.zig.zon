@@ -1,0 +1,13 @@
+.{
+    .name = .vec,
+    .version = "0.0.0",
+    .fingerprint = 0x630c62f0ad7c62e6,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
