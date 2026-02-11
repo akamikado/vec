@@ -95,7 +95,7 @@ const Object = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
-    name: [256]u8,
+    name: []u8,
     hash: [20]u8,
     kind: ObjectKind,
 
@@ -107,6 +107,7 @@ const Object = struct {
             c.deinit();
         }
         if (self.children.len > 0) self.allocator.free(self.children);
+        if (self.name.len > 0) self.allocator.free(self.name);
     }
 
     fn add_child(self: *Self, child: Object) !void {
@@ -206,7 +207,7 @@ fn check_status(allocator: std.mem.Allocator, cwd: std.fs.Dir) !void {
 
 fn construct_tree_from_hash(allocator: std.mem.Allocator, objs_dir: std.fs.Dir, hash: ?[]u8) !?Object {
     if (hash) |h| {
-        var root_node = Object {.allocator = allocator, .hash = [1]u8{0} ** 20, .name = [1]u8{0} ** 256, .kind = .tree };
+        var root_node = Object {.allocator = allocator, .hash = [1]u8{0} ** 20, .name = @constCast(&[1]u8{0} ** 256), .kind = .tree };
 
         var tree_file = try objs_dir.openFile(h, .{ .mode = .read_only });
         defer tree_file.close();
@@ -229,9 +230,10 @@ fn construct_tree_from_hash(allocator: std.mem.Allocator, objs_dir: std.fs.Dir, 
                 const obj_hash = it.next().?;
 
                 if (obj_kind == .blob) {
-                    const obj = Object {.allocator = allocator, .name = [1]u8{0} ** 256, .kind = obj_kind, .hash = [1]u8{0} ** 20};
-                    _ = try std.fmt.bufPrint(@constCast(&obj.name), "{s}", .{obj_name});
-                    _ = try std.fmt.bufPrint(@constCast(&obj.hash), "{s}", .{obj_hash});
+                    var obj = Object {.allocator = allocator, .name = @constCast(&[1]u8{0} ** 256), .kind = obj_kind, .hash = [1]u8{0} ** 20};
+                    _ = try std.fmt.bufPrint(obj.name, "{s}", .{obj_name});
+                    obj.name = obj.name[0..obj_name.len];
+                    _ = try std.fmt.bufPrint(&obj.hash, "{s}", .{obj_hash});
                     try root_node.add_child(obj);
                 } else {
                     const obj = try construct_tree_from_hash(allocator, objs_dir, @constCast(obj_hash));
@@ -252,15 +254,13 @@ fn construct_tree_from_dir(allocator: std.mem.Allocator, parent: ?*Object, objs_
 
     var root_obj = Object {
         .allocator = allocator,
-        .name = [1]u8{0} ** 256,
+        .name = &[0]u8{},
         .kind = .tree,
         .hash = [1]u8{0} ** 20,
     };
 
     if (parent) |_| {
-        _ = try std.fmt.bufPrint(@constCast(&root_obj.name), "{s}/", .{name});
-    } else {
-        @memset(@constCast(&root_obj.name), 0);
+        root_obj.name = try std.fmt.allocPrint(root_obj.allocator, "{s}/", .{name});
     }
 
     var it = d.iterate();
@@ -288,7 +288,7 @@ fn construct_tree_from_dir(allocator: std.mem.Allocator, parent: ?*Object, objs_
     }
 
     const hash = hasher.finalResult();
-    _ = try std.fmt.bufPrint(@constCast(&root_obj.hash), "{s}", .{hash});
+    _ = try std.fmt.bufPrint(&root_obj.hash, "{s}", .{hash});
     root_obj.parent = parent;
 
     return root_obj;
@@ -317,13 +317,13 @@ fn get_file_obj(allocator: std.mem.Allocator, parent: ?*Object, name: []const u8
 
     var obj = Object {
         .allocator = allocator,
-        .name = [1]u8{0} ** 256,
+        .name = &[0]u8{},
         .kind = .blob,
         .hash = [1]u8{0} ** 20,
         .parent = parent,
     };
-    _ = try std.fmt.bufPrint(@constCast(&obj.name), "{s}", .{name});
-    _ = try std.fmt.bufPrint(@constCast(&obj.hash), "{s}", .{hash});
+    obj.name = try std.fmt.allocPrint(obj.allocator, "{s}", .{name});
+    _ = try std.fmt.bufPrint(&obj.hash, "{s}", .{hash});
 
     return obj;
 }
@@ -349,7 +349,7 @@ fn compare_current_tree_with_commit_tree(allocator: std.mem.Allocator, commit_tr
 
         for (1..m+1) |i| {
             for (1..n+1) |j| {
-                if (std.mem.eql(u8, &ct.children[i-1].name, &current_tree.children[j-1].name) and ct.children[i-1].kind == current_tree.children[j-1].kind) {
+                if (std.mem.eql(u8, ct.children[i-1].name, current_tree.children[j-1].name)) {
                     dp[i][j] = dp[i-1][j-1] + 1;
                 } else {
                     dp[i][j] = @max(dp[i-1][j], dp[i][j-1]);
@@ -360,34 +360,34 @@ fn compare_current_tree_with_commit_tree(allocator: std.mem.Allocator, commit_tr
         var i = m;
         var j = n;
         while (i > 0 and j > 0) {
-            if (i > 0 and j > 0 and std.mem.eql(u8, &ct.children[i-1].name, &current_tree.children[j-1].name) and ct.children[i-1].kind == current_tree.children[j-1].kind) {
+            if (i > 0 and j > 0 and std.mem.eql(u8, ct.children[i-1].name, current_tree.children[j-1].name)) {
                 if (!std.mem.eql(u8, &ct.children[i-1].hash, &current_tree.children[j-1].hash)) {
                     if (current_tree.children[j-1].kind == .blob) {
-                        try all_status.append(allocator, .{ .name = &current_tree.children[j-1].name, .status = .modified });
+                        try all_status.append(allocator, .{ .name = current_tree.children[j-1].name, .status = .modified });
                     } else if (current_tree.children[j-1].kind == .tree) {
                         if (current_tree.children[j-1].children.len > 0) {
                             try compare_current_tree_with_commit_tree(allocator, ct.children[i-1], current_tree.children[j-1], all_status);
                         } else {
-                            try all_status.append(allocator, .{ .name = &current_tree.children[j-1].name, .status = .deleted });
+                            try all_status.append(allocator, .{ .name = current_tree.children[j-1].name, .status = .deleted });
                         }
                     }
                 }
                 i -= 1;
                 j -= 1;
             } else if (j > 0 and (i == 0 or dp[i][j-1] >= dp[i-1][j])) {
-                try all_status.append(allocator, .{ .name = &current_tree.children[j-1].name, .status = .untracked });
+                try all_status.append(allocator, .{ .name = current_tree.children[j-1].name, .status = .untracked });
                 j -= 1;
             } else {
-                try all_status.append(allocator, .{ .name = &ct.children[i-1].name, .status = .deleted });
+                try all_status.append(allocator, .{ .name = ct.children[i-1].name, .status = .deleted });
                 i -= 1;
             }
         }
     } else {
         for (current_tree.children) |*c| {
             if (c.kind == .blob) {
-                try all_status.append(allocator, .{ .name = &c.name, .status = .untracked });
+                try all_status.append(allocator, .{ .name = c.name, .status = .untracked });
             } else if (c.kind == .tree) {
-                if (c.children.len > 0) try all_status.append(allocator, .{ .name = &c.name, .status = .untracked });
+                if (c.children.len > 0) try all_status.append(allocator, .{ .name = c.name, .status = .untracked });
             }
         }
     }
