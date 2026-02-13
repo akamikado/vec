@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn main() !void {
     var args = std.process.args();
-    _ = args.skip();
+    const program_name = args.next().?;
 
     var cwd = try std.fs.cwd().openDir(".", .{.iterate = true});
     defer cwd.close();
@@ -16,6 +16,14 @@ pub fn main() !void {
             try init_vec_dir(cwd);
         } else if (std.mem.eql(u8, arg, "status")) {
             try check_status(allocator, cwd);
+        } else if (std.mem.eql(u8, arg, "commit")) {
+            if (args.next()) |msg| {
+                try commit_full_working_dir(allocator, cwd, msg);
+            } else {
+                std.debug.print("fatal: missing message\n", .{});
+                std.debug.print("usage: {s} commit <message>\n", .{program_name});
+                return;
+            }
         } else {
             std.debug.print("fatal: unknown argument: {s}\n", .{arg});
             return;
@@ -63,25 +71,36 @@ fn init_vec_dir(root_dir: std.fs.Dir) !void {
     };
 }
 
-fn get_head(vec_dir: std.fs.Dir) !?[]u8 {
-    var head_file_buf: [32]u8 = undefined;
+fn get_head(_: std.mem.Allocator, vec_dir: std.fs.Dir) !?[40]u8 {
+    var head_file_buf: [64]u8 = undefined;
     const head_file = try vec_dir.openFile("HEAD", .{});
     var r1 = head_file.reader(&head_file_buf);
     var reader1 = &r1.interface;
-    const head = try reader1.takeDelimiter('\n');
-    return head;
+    const head = reader1.peekArray(40) catch |err| {
+        switch (err) {
+            error.EndOfStream => { return null; },
+            else => return err,
+        }
+    };
+    var buf: [40]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    reader1.toss(40);
+    try w.print("{s}", .{head});
+    try w.flush();
+    return buf;
 }
 
-fn get_tree_for_commit(objs_dir: std.fs.Dir, commit: ?[]const u8) !?[]u8 {
+fn get_tree_for_commit(allocator: std.mem.Allocator, objs_dir: std.fs.Dir, commit: ?[40]u8) !?[]u8 {
     if (commit) |c| {
         var commit_file_buf: [128]u8 = undefined;
-        var commit_file = try objs_dir.openFile(c, .{ .mode = .read_only });
+        var commit_file = try objs_dir.openFile(&c, .{ .mode = .read_only });
         var r2 = commit_file.reader(&commit_file_buf);
         var reader2 = &r2.interface;
 
         _ = try reader2.takeDelimiter('\n');
-        const tree_obj = try reader2.takeDelimiter('\n');
-        return tree_obj;
+        if (try reader2.takeDelimiter('\n')) |t| {
+            return try allocator.dupe(u8, t);
+        }
     }
     return null;
 }
@@ -96,7 +115,7 @@ const Object = struct {
 
     allocator: std.mem.Allocator,
     name: []u8,
-    hash: [20]u8,
+    hash: [40]u8 = [1]u8{0} ** 40,
     kind: ObjectKind,
 
     children: []Self = &[0]Self{},
@@ -139,7 +158,6 @@ const ObjectStatus = struct {
     status: ObjectStatusKind = .unchanged,
 };
 
-
 fn check_status(allocator: std.mem.Allocator, cwd: std.fs.Dir) !void {
     var root_dir = try get_root_dir(cwd);
 
@@ -152,13 +170,12 @@ fn check_status(allocator: std.mem.Allocator, cwd: std.fs.Dir) !void {
     var all_status = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
     defer all_status.deinit(allocator);
 
-    const head = try get_head(vec_dir);
-    const tree = try get_tree_for_commit(objs_dir, head);
+    const head = try get_head(allocator, vec_dir);
+    const tree = try get_tree_for_commit(allocator, objs_dir, head);
+    defer if (tree) |t| allocator.free(t);
 
     var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
-    defer if (commit_tree) |*c| {
-        c.deinit();
-    };
+    defer if (commit_tree) |*c| c.deinit();
 
     var current_tree = try construct_tree_from_dir(allocator, null, objs_dir, "", root_dir);
     defer current_tree.deinit();
@@ -207,7 +224,8 @@ fn check_status(allocator: std.mem.Allocator, cwd: std.fs.Dir) !void {
 
 fn construct_tree_from_hash(allocator: std.mem.Allocator, objs_dir: std.fs.Dir, hash: ?[]u8) !?Object {
     if (hash) |h| {
-        var root_node = Object {.allocator = allocator, .hash = [1]u8{0} ** 20, .name = @constCast(&[1]u8{0} ** 256), .kind = .tree };
+        var root_obj = Object {.allocator = allocator, .name = &[0]u8{}, .kind = .tree };
+        _ = try std.fmt.bufPrint(&root_obj.hash, "{s}", .{h});
 
         var tree_file = try objs_dir.openFile(h, .{ .mode = .read_only });
         defer tree_file.close();
@@ -230,21 +248,24 @@ fn construct_tree_from_hash(allocator: std.mem.Allocator, objs_dir: std.fs.Dir, 
                 const obj_hash = it.next().?;
 
                 if (obj_kind == .blob) {
-                    var obj = Object {.allocator = allocator, .name = @constCast(&[1]u8{0} ** 256), .kind = obj_kind, .hash = [1]u8{0} ** 20};
-                    _ = try std.fmt.bufPrint(obj.name, "{s}", .{obj_name});
-                    obj.name = obj.name[0..obj_name.len];
+                    var obj = Object {.allocator = allocator, .name = &[0]u8{}, .kind = obj_kind};
+                    obj.name = try std.fmt.allocPrint(obj.allocator, "{s}", .{obj_name});
                     _ = try std.fmt.bufPrint(&obj.hash, "{s}", .{obj_hash});
-                    try root_node.add_child(obj);
+                    try root_obj.add_child(obj);
                 } else {
-                    const obj = try construct_tree_from_hash(allocator, objs_dir, @constCast(obj_hash));
-                    if (obj) |o| {
-                        try root_node.add_child(o);
+                    var obj = try construct_tree_from_hash(allocator, objs_dir, @constCast(obj_hash));
+                    if (obj) |*o| {
+                        o.name = try std.fmt.allocPrint(o.allocator, "{s}", .{obj_name});
+                        try root_obj.add_child(o.*);
                     }
                 }
+            } else {
+                break;
             }
         } else |err| {
             _ = err catch {};
         }
+        return root_obj;
     }
     return null;
 }
@@ -256,7 +277,6 @@ fn construct_tree_from_dir(allocator: std.mem.Allocator, parent: ?*Object, objs_
         .allocator = allocator,
         .name = &[0]u8{},
         .kind = .tree,
-        .hash = [1]u8{0} ** 20,
     };
 
     if (parent) |_| {
@@ -274,8 +294,10 @@ fn construct_tree_from_dir(allocator: std.mem.Allocator, parent: ?*Object, objs_
             var subdir = try d.openDir(e.name, .{.iterate = true});
             defer subdir.close();
             const obj = try construct_tree_from_dir(allocator, &root_obj, objs_dir, e.name, subdir);
-            hasher.update(&obj.hash);
-            try root_obj.add_child(obj);
+            if (obj.children.len > 0) {
+                hasher.update(&obj.hash);
+                try root_obj.add_child(obj);
+            }
         } else if (e.kind == .file) {
             var f = try d.openFile(e.name, .{ .mode = .read_only });
             defer f.close();
@@ -287,7 +309,8 @@ fn construct_tree_from_dir(allocator: std.mem.Allocator, parent: ?*Object, objs_
         entry = try it.next();
     }
 
-    const hash = hasher.finalResult();
+    const hash_bytes = hasher.finalResult();
+    const hash = std.fmt.bytesToHex(hash_bytes, .lower);
     _ = try std.fmt.bufPrint(&root_obj.hash, "{s}", .{hash});
     root_obj.parent = parent;
 
@@ -313,13 +336,13 @@ fn get_file_obj(allocator: std.mem.Allocator, parent: ?*Object, name: []const u8
     const remaining = reader.buffered();
     hasher.update(remaining);
 
-    const hash = hasher.finalResult();
+    const hash_bytes = hasher.finalResult();
+    const hash = std.fmt.bytesToHex(hash_bytes, .lower);
 
     var obj = Object {
         .allocator = allocator,
         .name = &[0]u8{},
         .kind = .blob,
-        .hash = [1]u8{0} ** 20,
         .parent = parent,
     };
     obj.name = try std.fmt.allocPrint(obj.allocator, "{s}", .{name});
@@ -329,7 +352,7 @@ fn get_file_obj(allocator: std.mem.Allocator, parent: ?*Object, name: []const u8
 }
 
 fn dump_obj(t: Object) void {
-    std.debug.print("name: {s}\thash: {s}\n", .{t.name, std.fmt.bytesToHex(t.hash, .upper)});
+    std.debug.print("name: {s}\thash: {s}\n", .{t.name, t.hash});
     for (t.children) |c| {
         dump_obj(c);
     }
@@ -342,10 +365,12 @@ fn compare_current_tree_with_commit_tree(allocator: std.mem.Allocator, commit_tr
         const m = ct.children.len;
         const n = current_tree.children.len;
         var dp = try allocator.alloc([]u32, m+1);
+        defer allocator.free(dp);
         for (0..dp.len) |i| {
             dp[i] = try allocator.alloc(u32, n+1);
             @memset(dp[i], 0);
         }
+        defer for (0..dp.len) |i| allocator.free(dp[i]);
 
         for (1..m+1) |i| {
             for (1..n+1) |j| {
@@ -365,11 +390,7 @@ fn compare_current_tree_with_commit_tree(allocator: std.mem.Allocator, commit_tr
                     if (current_tree.children[j-1].kind == .blob) {
                         try all_status.append(allocator, .{ .name = current_tree.children[j-1].name, .status = .modified });
                     } else if (current_tree.children[j-1].kind == .tree) {
-                        if (current_tree.children[j-1].children.len > 0) {
                             try compare_current_tree_with_commit_tree(allocator, ct.children[i-1], current_tree.children[j-1], all_status);
-                        } else {
-                            try all_status.append(allocator, .{ .name = current_tree.children[j-1].name, .status = .deleted });
-                        }
                     }
                 }
                 i -= 1;
@@ -387,8 +408,117 @@ fn compare_current_tree_with_commit_tree(allocator: std.mem.Allocator, commit_tr
             if (c.kind == .blob) {
                 try all_status.append(allocator, .{ .name = c.name, .status = .untracked });
             } else if (c.kind == .tree) {
-                if (c.children.len > 0) try all_status.append(allocator, .{ .name = c.name, .status = .untracked });
+                try all_status.append(allocator, .{ .name = c.name, .status = .untracked });
             }
         }
     }
+}
+
+fn commit_full_working_dir(allocator: std.mem.Allocator, cwd: std.fs.Dir, msg: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
+
+    var all_status = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer all_status.deinit(allocator);
+
+    const head = try get_head(allocator, vec_dir);
+    const tree = try get_tree_for_commit(allocator, objs_dir, head);
+    defer if (tree) |t| allocator.free(t);
+
+    var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
+    defer if (commit_tree) |*c| c.deinit();
+
+    var current_tree = try construct_tree_from_dir(allocator, null, objs_dir, "", root_dir);
+    defer current_tree.deinit();
+
+    if (head) |h| if (std.mem.eql(u8, &h, &current_tree.hash)) return;
+    try store_tree(root_dir, objs_dir, current_tree);
+    const new_commit = try write_commit_obj(objs_dir, head, current_tree.hash, msg);
+    try set_head(vec_dir, new_commit);
+}
+
+fn store_tree(working_dir: std.fs.Dir, objs_dir: std.fs.Dir, tree: Object) !void {
+    const tree_file_name = tree.hash;
+    if (objs_dir.access(&tree_file_name, .{})) {
+        return;
+    } else |err| {
+        switch (err) {
+            error.FileNotFound => {},
+            else => return err
+        }
+    }
+    var tree_file = try objs_dir.createFile(&tree_file_name, .{});
+    tree_file.close();
+    tree_file = try objs_dir.openFile(&tree_file_name, .{ .mode = .read_write });
+    defer tree_file.close();
+    var tree_buf: [1024]u8 = undefined;
+    var tree_writer = tree_file.writer(&tree_buf);
+    var tw = &tree_writer.interface;
+
+    for (tree.children) |c| {
+        try tw.print("{s} {s} {s}\n", .{@tagName(c.kind), c.name, c.hash});
+        try tw.flush();
+        if (c.kind == .tree) {
+            var subdir = try working_dir.openDir(c.name, .{ .iterate = true });
+            defer subdir.close();
+            try store_tree(subdir, objs_dir, c);
+        } else {
+            const blob_file_name = c.hash;
+            if (objs_dir.access(&blob_file_name, .{})) {
+                return;
+            } else |err| {
+                switch (err) {
+                    error.FileNotFound => {},
+                    else => return err
+                }
+            }
+            try std.fs.Dir.copyFile(working_dir, c.name, objs_dir, &blob_file_name, .{});
+        }
+    }
+}
+
+fn write_commit_obj(objs_dir: std.fs.Dir, prev_commit_hash: ?[40]u8, tree_hash: [40]u8, msg: []const u8) ![40]u8 {
+    var hasher = std.crypto.hash.Sha1.init(.{});
+    if (prev_commit_hash) |ph| hasher.update(&ph) else hasher.update(&[1]u8{0});
+    hasher.update(&tree_hash);
+    hasher.update(msg);
+    const hash_bytes = hasher.finalResult();
+    const hash = std.fmt.bytesToHex(hash_bytes, .lower);
+
+    const file_name = hash;
+    var f = try objs_dir.createFile(&file_name, .{});
+    f.close();
+    f = try objs_dir.openFile(&file_name, .{ .mode = .read_write });
+    defer f.close();
+
+    var buf: [1024]u8 = undefined;
+    var writer = f.writer(&buf);
+    var w = &writer.interface;
+
+    if (prev_commit_hash) |ph| 
+        try w.print("{s}\n", .{ph}) 
+    else 
+        try w.print("0\n", .{});
+    try w.print("{s}\n", .{tree_hash});
+    try w.flush();
+    try w.print("{s}\n", .{msg});
+    try w.flush();
+    return hash;
+}
+
+fn set_head(vec_dir: std.fs.Dir, new_head: [40]u8) !void {
+    var head_file = try vec_dir.openFile("HEAD", .{ .mode = .read_write });
+    defer head_file.close();
+
+    var buf: [1024]u8 = undefined;
+    var w = head_file.writer(&buf);
+    var writer = &w.interface;
+
+    try writer.print("{s}", .{new_head});
+    try writer.flush();
 }
