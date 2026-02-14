@@ -7,9 +7,12 @@ A simple version control system written in [zig](https://ziglang.org/), built to
     - Modified files/directories
     - Deleted files/directories
 - Commit: takes snapshot of entire working directory
+- Log: view commit history
 
 ## Planned Features
 - [ ] Commit History
+    - [x] View commit history
+    - [ ] Patch working directory to committed snapshots
 - [ ] Object Compression: Reduce storage size of stored objects
 - [ ] Staging area
 - [ ] Diff Support: Show difference between working directory and previous commit

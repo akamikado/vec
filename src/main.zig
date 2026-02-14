@@ -24,6 +24,8 @@ pub fn main() !void {
                 std.debug.print("usage: {s} commit <message>\n", .{program_name});
                 return;
             }
+        } else if (std.mem.eql(u8, arg, "log")) {
+            try list_commits(allocator, cwd);
         } else {
             std.debug.print("fatal: unknown argument: {s}\n", .{arg});
             return;
@@ -74,9 +76,9 @@ fn init_vec_dir(root_dir: std.fs.Dir) !void {
 fn get_head(_: std.mem.Allocator, vec_dir: std.fs.Dir) !?[40]u8 {
     var head_file_buf: [64]u8 = undefined;
     const head_file = try vec_dir.openFile("HEAD", .{});
-    var r1 = head_file.reader(&head_file_buf);
-    var reader1 = &r1.interface;
-    const head = reader1.peekArray(40) catch |err| {
+    var r = head_file.reader(&head_file_buf);
+    var reader = &r.interface;
+    const head = reader.peekArray(40) catch |err| {
         switch (err) {
             error.EndOfStream => { return null; },
             else => return err,
@@ -84,8 +86,32 @@ fn get_head(_: std.mem.Allocator, vec_dir: std.fs.Dir) !?[40]u8 {
     };
     var buf: [40]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
-    reader1.toss(40);
+    reader.toss(40);
     try w.print("{s}", .{head});
+    try w.flush();
+    return buf;
+}
+
+fn get_parent_commit(objs_dir: std.fs.Dir, commit: [40]u8) !?[40]u8 {
+    var commit_file_buf: [128]u8 = undefined;
+    var commit_file = try objs_dir.openFile(&commit, .{ .mode = .read_only });
+    var r = commit_file.reader(&commit_file_buf);
+    var reader = &r.interface;
+
+    switch (try reader.peekByte()) {
+        '\n' => return null,
+        else => {}
+    }
+    const parent_commit = reader.peekArray(40) catch |err| {
+        switch (err) {
+            error.EndOfStream => { return null; },
+            else => return err,
+        }
+    };
+    var buf: [40]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    reader.toss(40);
+    try w.print("{s}", .{parent_commit});
     try w.flush();
     return buf;
 }
@@ -94,15 +120,26 @@ fn get_tree_for_commit(allocator: std.mem.Allocator, objs_dir: std.fs.Dir, commi
     if (commit) |c| {
         var commit_file_buf: [128]u8 = undefined;
         var commit_file = try objs_dir.openFile(&c, .{ .mode = .read_only });
-        var r2 = commit_file.reader(&commit_file_buf);
-        var reader2 = &r2.interface;
+        var r = commit_file.reader(&commit_file_buf);
+        var reader = &r.interface;
 
-        _ = try reader2.takeDelimiter('\n');
-        if (try reader2.takeDelimiter('\n')) |t| {
+        _ = try reader.takeDelimiter('\n');
+        if (try reader.takeDelimiter('\n')) |t| {
             return try allocator.dupe(u8, t);
         }
     }
     return null;
+}
+
+fn get_commit_message(allocator: std.mem.Allocator, objs_dir: std.fs.Dir, commit: [40]u8) ![]u8 {
+    var commit_file_buf: [128]u8 = undefined;
+    var commit_file = try objs_dir.openFile(&commit, .{ .mode = .read_only });
+    var r = commit_file.reader(&commit_file_buf);
+    var reader = &r.interface;
+
+    _ = try reader.takeDelimiter('\n');
+    _ = try reader.takeDelimiter('\n');
+    return try reader.allocRemaining(allocator, .unlimited);
 }
 
 const ObjectKind = enum {
@@ -503,7 +540,7 @@ fn write_commit_obj(objs_dir: std.fs.Dir, prev_commit_hash: ?[40]u8, tree_hash: 
     if (prev_commit_hash) |ph| 
         try w.print("{s}\n", .{ph}) 
     else 
-        try w.print("0\n", .{});
+        try w.print("\n", .{});
     try w.print("{s}\n", .{tree_hash});
     try w.flush();
     try w.print("{s}\n", .{msg});
@@ -521,4 +558,31 @@ fn set_head(vec_dir: std.fs.Dir, new_head: [40]u8) !void {
 
     try writer.print("{s}", .{new_head});
     try writer.flush();
+}
+
+fn list_commits(allocator: std.mem.Allocator, cwd: std.fs.Dir) !void {
+    var root_dir = try get_root_dir(cwd);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
+
+    const head = try get_head(allocator, vec_dir);
+    if (head) |h| {
+        var msg = try get_commit_message(allocator, objs_dir, h);
+        std.debug.print("commit {s} (HEAD)\n", .{h});
+        std.debug.print("   {s}\n", .{msg});
+        allocator.free(msg);
+
+        var it = try get_parent_commit(objs_dir, h);
+        while (it) |commit| {
+            msg = try get_commit_message(allocator, objs_dir, commit);
+            defer allocator.free(msg);
+            std.debug.print("commit {s}\n", .{commit});
+            std.debug.print("   {s}\n", .{msg});
+            it = try get_parent_commit(objs_dir, commit);
+        } else {}
+    }
 }
