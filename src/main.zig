@@ -13,8 +13,18 @@ pub fn main() !void {
 
     if (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "init")) {
+            if (args.next()) |cmd| {
+                std.debug.print("fatal: unknown command {s}\n", .{cmd});
+                std.debug.print("usage: {s} init\n", .{program_name});
+                return;
+            }
             try init_vec_dir(cwd);
         } else if (std.mem.eql(u8, arg, "status")) {
+            if (args.next()) |cmd| {
+                std.debug.print("fatal: unknown command {s}\n", .{cmd});
+                std.debug.print("usage: {s} status\n", .{program_name});
+                return;
+            }
             try check_status(allocator, cwd);
         } else if (std.mem.eql(u8, arg, "commit")) {
             if (args.next()) |msg| {
@@ -25,6 +35,11 @@ pub fn main() !void {
                 return;
             }
         } else if (std.mem.eql(u8, arg, "log")) {
+            if (args.next()) |cmd| {
+                std.debug.print("fatal: unknown command {s}\n", .{cmd});
+                std.debug.print("usage: {s} log\n", .{program_name});
+                return;
+            }
             try list_commits(allocator, cwd);
         } else {
             std.debug.print("fatal: unknown argument: {s}\n", .{arg});
