@@ -9,7 +9,7 @@ const fmt = std.fmt;
 
 pub fn main() !void {
     var args = process.args();
-    const program_name = args.next().?;
+    _ = args.next();
 
     var cwd = try fs.cwd().openDir(".", .{.iterate = true});
     defer cwd.close();
@@ -21,33 +21,52 @@ pub fn main() !void {
     if (args.next()) |arg| {
         if (mem.eql(u8, arg, "init")) {
             if (args.next()) |cmd| {
-                debug.print("fatal: unknown command {s}\n", .{cmd});
-                debug.print("usage: {s} init\n", .{program_name});
+                if (!mem.eql(u8, cmd, "-h") and !mem.eql(u8, cmd, "--help")) 
+                    debug.print("fatal: unknown command {s}\n", .{cmd});
+                debug.print("usage: vec init\n", .{});
                 return;
             }
             try init_vec_dir(cwd);
         } else if (mem.eql(u8, arg, "status")) {
             if (args.next()) |cmd| {
-                debug.print("fatal: unknown command {s}\n", .{cmd});
-                debug.print("usage: {s} status\n", .{program_name});
+                if (!mem.eql(u8, cmd, "-h") and !mem.eql(u8, cmd, "--help")) 
+                    debug.print("fatal: unknown command {s}\n", .{cmd});
+                debug.print("usage: vec status\n", .{});
                 return;
             }
             try check_status(allocator, cwd);
         } else if (mem.eql(u8, arg, "commit")) {
-            if (args.next()) |msg| {
-                try commit_full_working_dir(allocator, cwd, msg);
+            const arg2 = args.next();
+            if (arg2) |cmd| {
+                if (mem.eql(u8, cmd, "-h") or mem.eql(u8, cmd, "--help")) {
+                    debug.print("usage: vec log\n", .{});
+                    return;
+                }
+                try commit_full_working_dir(allocator, cwd, cmd);
             } else {
                 debug.print("fatal: missing message\n", .{});
-                debug.print("usage: {s} commit <message>\n", .{program_name});
+                debug.print("usage: vec commit <message>\n", .{});
                 return;
             }
         } else if (mem.eql(u8, arg, "log")) {
             if (args.next()) |cmd| {
-                debug.print("fatal: unknown command {s}\n", .{cmd});
-                debug.print("usage: {s} log\n", .{program_name});
+                if (!mem.eql(u8, cmd, "-h") and !mem.eql(u8, cmd, "--help")) 
+                    debug.print("fatal: unknown command {s}\n", .{cmd});
+                debug.print("usage: vec log\n", .{});
                 return;
             }
             try list_commits(allocator, cwd);
+        } else if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help") or mem.eql(u8, arg, "help")) {
+            const help_str = 
+                \\usage: vec <command> [<args>]
+                \\
+                \\Available commands:
+                \\  init:   Create a working area
+                \\  status: Show the working tree status
+                \\  commit: Record changes to the working area
+                \\  log:    Show commit logs
+            ;
+            debug.print("{s}\n", .{help_str});
         } else {
             debug.print("fatal: unknown argument: {s}\n", .{arg});
             return;
