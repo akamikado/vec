@@ -35,6 +35,19 @@ pub fn main() !void {
                 return;
             }
             try check_status(allocator, cwd);
+        } else if (mem.eql(u8, arg, "add")) {
+            const arg2 = args.next();
+            if (arg2) |cmd| {
+                if (mem.eql(u8, cmd, "-h") or mem.eql(u8, cmd, "--help")) {
+                    debug.print("usage: vec add <file>\n", .{});
+                    return;
+                }
+                try add_to_index(allocator, cwd, cmd);
+            } else {
+                debug.print("fatal: missing message\n", .{});
+                debug.print("usage: vec add <path>\n", .{});
+                return;
+            }
         } else if (mem.eql(u8, arg, "commit")) {
             const arg2 = args.next();
             if (arg2) |cmd| {
@@ -107,6 +120,12 @@ fn init_vec_dir(root_dir: fs.Dir) !void {
         }
     };
     _ = root_dir.createFile(".vec/HEAD", .{}) catch |err| {
+        switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err
+        }
+    };
+    _ = root_dir.createFile(".vec/INDEX", .{}) catch |err| {
         switch (err) {
             error.PathAlreadyExists => {},
             else => return err
@@ -200,9 +219,7 @@ const Object = struct {
     parent: ?*Self = null,
 
     fn deinit(self: *Self) void {
-        for (self.children) |*c| {
-            c.deinit();
-        }
+        if (self.kind == .tree) for (self.children) |*c| c.deinit();
         if (self.children.len > 0) self.allocator.free(self.children);
         if (self.name.len > 0) self.allocator.free(self.name);
     }
@@ -395,6 +412,24 @@ fn construct_tree_from_dir(allocator: mem.Allocator, parent: ?*Object, objs_dir:
     return root_obj;
 }
 
+fn get_obj_from_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8, objs_dir: fs.Dir) !Object {
+    var it = mem.splitBackwardsScalar(u8, path, '/');
+    const name = it.next().?;
+    const s = try cwd.statFile(path);
+    if (s.kind == .file) {
+        var f = try cwd.openFile(path, .{ .mode = .read_only });
+        defer f.close();
+        const obj = try get_file_obj(allocator, null, name, f);
+        return obj;
+    } else if (s.kind == .directory) {
+        const subdir = try cwd.openDir(path, .{ .iterate = true });
+
+        const obj = construct_tree_from_dir(allocator, null, objs_dir, name, subdir);
+        return obj;
+    }
+    return error.InvalidFileType;
+}
+
 fn get_file_obj(allocator: mem.Allocator, parent: ?*Object, name: []const u8, f: fs.File) !Object {
     var hasher = crypto.hash.Sha1.init(.{});
 
@@ -515,13 +550,26 @@ fn commit_full_working_dir(allocator: mem.Allocator, cwd: fs.Dir, msg: []const u
     defer current_tree.deinit();
 
     if (head) |h| if (mem.eql(u8, &h, &current_tree.hash)) return;
-    try store_tree(root_dir, objs_dir, current_tree);
+    try store_tree_obj(root_dir, objs_dir, current_tree);
     const new_commit = try write_commit_obj(objs_dir, head, current_tree.hash, msg);
     try set_head(vec_dir, new_commit);
 }
 
-fn store_tree(working_dir: fs.Dir, objs_dir: fs.Dir, tree: Object) !void {
-    const tree_file_name = tree.hash;
+fn store_blob_obj(working_dir: fs.Dir, objs_dir: fs.Dir, blob_obj: Object) !void {
+    const blob_file_name = blob_obj.hash;
+    if (objs_dir.access(&blob_file_name, .{})) {
+        return;
+    } else |err| {
+        switch (err) {
+            error.FileNotFound => {},
+            else => return err
+        }
+    }
+    try fs.Dir.copyFile(working_dir, blob_obj.name, objs_dir, &blob_file_name, .{});
+}
+
+fn store_tree_obj(working_dir: fs.Dir, objs_dir: fs.Dir, tree_obj: Object) !void {
+    const tree_file_name = tree_obj.hash;
     if (objs_dir.access(&tree_file_name, .{})) {
         return;
     } else |err| {
@@ -534,28 +582,19 @@ fn store_tree(working_dir: fs.Dir, objs_dir: fs.Dir, tree: Object) !void {
     tree_file.close();
     tree_file = try objs_dir.openFile(&tree_file_name, .{ .mode = .read_write });
     defer tree_file.close();
-    var tree_buf: [1024]u8 = undefined;
-    var tree_writer = tree_file.writer(&tree_buf);
-    var tw = &tree_writer.interface;
+    var file_buf: [1024]u8 = undefined;
+    var writer = tree_file.writer(&file_buf);
+    var w = &writer.interface;
 
-    for (tree.children) |c| {
-        try tw.print("{s} {s} {s}\n", .{@tagName(c.kind), c.name, c.hash});
-        try tw.flush();
+    for (tree_obj.children) |c| {
+        try w.print("{s} {s} {s}\n", .{@tagName(c.kind), c.name, c.hash});
+        try w.flush();
         if (c.kind == .tree) {
             var subdir = try working_dir.openDir(c.name, .{ .iterate = true });
             defer subdir.close();
-            try store_tree(subdir, objs_dir, c);
+            try store_tree_obj(subdir, objs_dir, c);
         } else {
-            const blob_file_name = c.hash;
-            if (objs_dir.access(&blob_file_name, .{})) {
-                return;
-            } else |err| {
-                switch (err) {
-                    error.FileNotFound => {},
-                    else => return err
-                }
-            }
-            try fs.Dir.copyFile(working_dir, c.name, objs_dir, &blob_file_name, .{});
+            try store_blob_obj(working_dir, objs_dir, c);
         }
     }
 }
@@ -587,6 +626,17 @@ fn write_commit_obj(objs_dir: fs.Dir, prev_commit_hash: ?[40]u8, tree_hash: [40]
     try w.print("{s}\n", .{msg});
     try w.flush();
     return hash;
+}
+
+fn write_indexed_objs(index_file: fs.File, objs: []Object) !void {
+    var buf: [2*1024]u8 = undefined;
+    var w = index_file.writer(&buf);
+    var writer = &w.interface;
+
+    for (objs) |o| {
+        try writer.print("{s} {s}\n", .{o.name, o.hash});
+        try writer.flush();
+    }
 }
 
 fn set_head(vec_dir: fs.Dir, new_head: [40]u8) !void {
@@ -626,4 +676,80 @@ fn list_commits(allocator: mem.Allocator, cwd: fs.Dir) !void {
             it = try get_parent_commit(objs_dir, commit);
         } else {}
     }
+}
+
+fn get_indexed_objs(allocator: mem.Allocator, index_file: fs.File) ![]Object {
+    var file_buf: [1024]u8 = undefined;
+    var r = index_file.reader(&file_buf);
+    var reader = &r.interface;
+
+    var objs = try std.ArrayList(Object).initCapacity(allocator, 16);
+    defer objs.deinit(allocator);
+
+    while (reader.takeDelimiter('\n')) |line| {
+        if (line) |l| {
+            var it = mem.splitScalar(u8, l, ' ');
+            const obj_name = it.next().?;
+            const obj_hash = it.next().?;
+            var obj = Object {.allocator = allocator, .name = &[0]u8{}, .kind = .blob};
+            obj.name = try fmt.allocPrint(obj.allocator, "{s}", .{obj_name});
+            _ = try fmt.bufPrint(&obj.hash, "{s}", .{obj_hash});
+            try objs.append(allocator, obj);
+        } else {
+            break;
+        }
+    } else |err| {
+        _ = err catch {};
+    }
+    return objs.toOwnedSlice(allocator);
+}
+
+fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+    const root_path = try root_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
+
+    const full_path = try cwd.realpathAlloc(allocator, path);
+    defer allocator.free(full_path);
+    if (full_path.len < root_path.len or !std.mem.eql(u8, root_path, full_path[0..root_path.len])) {
+        debug.print("fatal: provided path '{s}' is outside working directory '{s}'\n", .{full_path, root_path});
+        process.exit(1);
+    }
+
+    const s = try cwd.statFile(path);
+    if (s.kind != .file) {
+        debug.print("fatal: provided path '{s}' is not a file\n", .{full_path});
+        process.exit(1);
+    }
+
+    const index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
+    var indexed_objs = try get_indexed_objs(allocator, index_file);
+    defer allocator.free(indexed_objs);
+    defer for (indexed_objs) |*o| o.deinit(); 
+
+    var file_obj = try get_obj_from_path(allocator, cwd, full_path[root_path.len+1..], objs_dir);
+    defer file_obj.deinit();
+
+    var is_present = false;
+    for (0..indexed_objs.len) |i| {
+        if (mem.eql(u8, indexed_objs[i].name, file_obj.name)) {
+            is_present = true;
+            if (!mem.eql(u8, &indexed_objs[i].hash, &file_obj.hash)) _ = try fmt.bufPrint(&indexed_objs[i].hash, "{s}", .{file_obj.hash}) else return;
+            break;
+        }
+    }
+
+    if (!is_present) {
+        indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len + 1);
+        indexed_objs[indexed_objs.len-1] = file_obj;
+    }
+
+    try write_indexed_objs(index_file, indexed_objs);
+    try store_blob_obj(cwd, objs_dir, file_obj);
 }
