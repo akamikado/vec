@@ -55,6 +55,7 @@ pub fn main() !void {
                     debug.print("usage: vec log\n", .{});
                     return;
                 }
+                // TODO: change to committing the indexed files
                 try commit_full_working_dir(allocator, cwd, cmd);
             } else {
                 debug.print("fatal: missing message\n", .{});
@@ -253,6 +254,7 @@ const ObjectStatus = struct {
     status: ObjectStatusKind = .unchanged,
 };
 
+// TODO: check status by comparing index to head commit to get changed objects and comparing index to working dir to get staged objects
 fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var root_dir = try get_root_dir(cwd);
 
