@@ -55,8 +55,7 @@ pub fn main() !void {
                     debug.print("usage: vec log\n", .{});
                     return;
                 }
-                // TODO: change to committing the indexed files
-                try commit_full_working_dir(allocator, cwd, cmd);
+                try snapshot_index(allocator, cwd, cmd);
             } else {
                 debug.print("fatal: missing message\n", .{});
                 debug.print("usage: vec commit <message>\n", .{});
@@ -283,7 +282,7 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
     defer if (commit_tree) |*t| t.deinit();
 
-    var current_tree = try construct_tree_from_dir(allocator, null, objs_dir, "", root_dir);
+    var current_tree = try construct_tree_from_dir(allocator, null, "", root_dir);
     defer current_tree.deinit();
 
     var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
@@ -291,8 +290,6 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
 
     var index_tree = try construct_tree_from_index(allocator, index_file);
     defer if (index_tree) |*t| t.deinit();
-
-    debug.assert(index_tree != null or commit_tree == null);
 
     var staged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
     defer staged_changes.deinit(allocator);
@@ -417,7 +414,7 @@ fn construct_tree_from_hash(allocator: mem.Allocator, objs_dir: fs.Dir, hash: ?[
     return null;
 }
 
-fn construct_tree_from_dir(allocator: mem.Allocator, parent: ?*Object, objs_dir: fs.Dir, name: []const u8, d: fs.Dir) !Object {
+fn construct_tree_from_dir(allocator: mem.Allocator, parent: ?*Object, name: []const u8, d: fs.Dir) !Object {
     var hasher = crypto.hash.Sha1.init(.{});
 
     var root_obj = Object {
@@ -440,7 +437,7 @@ fn construct_tree_from_dir(allocator: mem.Allocator, parent: ?*Object, objs_dir:
         if (e.kind == .directory) {
             var subdir = try d.openDir(e.name, .{.iterate = true});
             defer subdir.close();
-            const obj = try construct_tree_from_dir(allocator, &root_obj, objs_dir, e.name, subdir);
+            const obj = try construct_tree_from_dir(allocator, &root_obj, e.name, subdir);
             if (obj.children.len > 0) {
                 hasher.update(&obj.hash);
                 try root_obj.add_child(obj);
@@ -511,7 +508,7 @@ fn construct_tree_from_index(allocator: mem.Allocator, index_file: fs.File) !?Ob
     return root_obj;
 }
 
-fn get_obj_from_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8, objs_dir: fs.Dir) !Object {
+fn get_obj_from_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !Object {
     const s = try cwd.statFile(path);
     if (s.kind == .file) {
         var f = try cwd.openFile(path, .{ .mode = .read_only });
@@ -521,7 +518,7 @@ fn get_obj_from_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8, ob
     } else if (s.kind == .directory) {
         const subdir = try cwd.openDir(path, .{ .iterate = true });
 
-        const obj = construct_tree_from_dir(allocator, null, objs_dir, path, subdir);
+        const obj = construct_tree_from_dir(allocator, null, path, subdir);
         return obj;
     }
     return error.InvalidFileType;
@@ -650,7 +647,29 @@ fn compare_index_tree_with_current_tree(allocator: mem.Allocator, index_tree: ?O
     }
 }
 
-fn commit_full_working_dir(allocator: mem.Allocator, cwd: fs.Dir, msg: []const u8) !void {
+fn snapshot_index(allocator: mem.Allocator, cwd: fs.Dir, msg: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
+    defer index_file.close();
+
+    var index_tree = try construct_tree_from_index(allocator, index_file);
+    defer if (index_tree) |*t| t.deinit();
+    
+    if (index_tree) |t| {
+        try snapshot_tree(allocator, cwd, t, msg);
+    } else {
+        try check_status(allocator, cwd);
+        debug.print("no changes to commit\n", .{});
+        return;
+    }
+
+}
+
+fn snapshot_tree(allocator: mem.Allocator, cwd:fs.Dir, tree: Object, msg: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
 
     var vec_dir = try root_dir.openDir(".vec", .{});
@@ -659,22 +678,18 @@ fn commit_full_working_dir(allocator: mem.Allocator, cwd: fs.Dir, msg: []const u
     var objs_dir = try vec_dir.openDir("objects", .{});
     defer objs_dir.close();
 
-    var all_status = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
-    defer all_status.deinit(allocator);
-
     const head = try get_head(allocator, vec_dir);
-    const tree = try get_tree_for_commit(allocator, objs_dir, head);
-    defer if (tree) |t| allocator.free(t);
+    const head_tree = try get_tree_for_commit(allocator, objs_dir, head);
+    defer if (head_tree) |t| allocator.free(t);
 
-    var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
-    defer if (commit_tree) |*c| c.deinit();
-
-    var current_tree = try construct_tree_from_dir(allocator, null, objs_dir, "", root_dir);
-    defer current_tree.deinit();
-
-    if (head) |h| if (mem.eql(u8, &h, &current_tree.hash)) return;
-    try store_tree_obj(root_dir, objs_dir, current_tree);
-    const new_commit = try write_commit_obj(objs_dir, head, current_tree.hash, msg);
+    if (head_tree) |ht| 
+        if (mem.eql(u8, ht, &tree.hash)) {
+            try check_status(allocator, cwd);
+            debug.print("no changes to commit\n", .{});
+            return;
+        };
+    try store_tree_obj(root_dir, objs_dir, tree);
+    const new_commit = try write_commit_obj(objs_dir, head, tree.hash, msg);
     try set_head(vec_dir, new_commit);
 }
 
@@ -827,7 +842,6 @@ fn get_indexed_objs(allocator: mem.Allocator, index_file: fs.File) ![]Object {
     return objs.toOwnedSlice(allocator);
 }
 
-// TODO: doesn't add modified/deleted files properly
 fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
@@ -857,7 +871,7 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     defer allocator.free(indexed_objs);
     defer for (indexed_objs) |*o| o.deinit(); 
 
-    var file_obj = try get_obj_from_path(allocator, cwd, full_path[root_path.len+1..], objs_dir);
+    var file_obj = try get_obj_from_path(allocator, cwd, full_path[root_path.len+1..]);
 
     var is_present = false;
     for (0..indexed_objs.len) |i| {
