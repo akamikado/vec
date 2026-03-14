@@ -242,6 +242,18 @@ const Object = struct {
     }
 };
 
+fn update_hashes(obj: *Object) !void {
+    var hasher = crypto.hash.Sha1.init(.{});
+    for (obj.children) |*c| {
+        if (c.kind == .tree) try update_hashes(c);
+        hasher.update(&c.hash);
+    }
+    const hash_bytes = hasher.finalResult();
+    const hash = fmt.bytesToHex(hash_bytes, .lower);
+    _ = try fmt.bufPrint(&obj.hash, "{s}", .{hash});
+}
+
+
 const ObjectStatusKind = enum {
     unchanged,
     untracked,
@@ -250,11 +262,11 @@ const ObjectStatusKind = enum {
 };
 
 const ObjectStatus = struct {
-    name: []const u8,
+    obj: Object,
     status: ObjectStatusKind = .unchanged,
 };
 
-// TODO: check status by comparing index to head commit to get changed objects and comparing index to working dir to get staged objects
+// TODO: print full path of objects
 fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var root_dir = try get_root_dir(cwd);
 
@@ -264,58 +276,96 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var objs_dir = try vec_dir.openDir("objects", .{});
     defer objs_dir.close();
 
-    var all_status = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
-    defer all_status.deinit(allocator);
-
     const head = try get_head(allocator, vec_dir);
     const tree = try get_tree_for_commit(allocator, objs_dir, head);
     defer if (tree) |t| allocator.free(t);
 
     var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
-    defer if (commit_tree) |*c| c.deinit();
+    defer if (commit_tree) |*t| t.deinit();
 
     var current_tree = try construct_tree_from_dir(allocator, null, objs_dir, "", root_dir);
     defer current_tree.deinit();
 
-    try compare_current_tree_with_commit_tree(allocator, commit_tree, current_tree, &all_status);
+    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
+    defer index_file.close();
 
-    var untracked_objs = try std.ArrayList(usize).initCapacity(allocator, 8);
-    defer untracked_objs.deinit(allocator);
+    var index_tree = try construct_tree_from_index(allocator, index_file);
+    defer if (index_tree) |*t| t.deinit();
 
-    var modified_objs = try std.ArrayList(usize).initCapacity(allocator, 8);
-    defer modified_objs.deinit(allocator);
+    debug.assert(index_tree != null or commit_tree == null);
 
-    var deleted_objs = try std.ArrayList(usize).initCapacity(allocator, 8);
-    defer deleted_objs.deinit(allocator);
+    var staged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer staged_changes.deinit(allocator);
 
-    for (0..all_status.items.len) |i| {
-        switch (all_status.items[i].status) {
-            .untracked => try untracked_objs.append(allocator, i),
-            .modified => try modified_objs.append(allocator, i),
-            .deleted => try deleted_objs.append(allocator, i),
-            else => {}
+    var unstaged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer unstaged_changes.deinit(allocator);
+
+
+    if (index_tree) |t| try compare_index_tree_with_commit_tree(allocator, t, commit_tree, &staged_changes);
+    try compare_index_tree_with_current_tree(allocator, index_tree, current_tree, &unstaged_changes);
+
+    var staged_untracked_objs = try std.ArrayList(usize).initCapacity(allocator, 8);
+    defer staged_untracked_objs.deinit(allocator);
+
+    var staged_modified_objs = try std.ArrayList(usize).initCapacity(allocator, 8);
+    defer staged_modified_objs.deinit(allocator);
+
+    var staged_deleted_objs = try std.ArrayList(usize).initCapacity(allocator, 8);
+    defer staged_deleted_objs.deinit(allocator);
+
+
+    for (0..staged_changes.items.len) |i| {
+        switch (staged_changes.items[i].status) {
+            .untracked => try staged_untracked_objs.append(allocator, i),
+            .modified  => try staged_modified_objs.append(allocator, i),
+            .deleted   => try staged_deleted_objs.append(allocator, i),
+            else       => {}
         }
     }
 
-    if (modified_objs.items.len > 0) {
-        debug.print("Modified files:\n", .{});
-        for (modified_objs.items) |i| {
-            debug.print("   {s}\n", .{all_status.items[i].name});
+    if (staged_changes.items.len > 0) debug.print("Staged changes:\n", .{});
+    for (staged_modified_objs.items) |i| {
+        debug.print("\tmodified:\t{s}\n", .{staged_changes.items[i].obj.name});
+    }
+
+    for (staged_untracked_objs.items) |i| {
+        debug.print("\tuntracked:\t{s}\n", .{staged_changes.items[i].obj.name});
+    }
+
+    for (staged_deleted_objs.items) |i| {
+        debug.print("\tdeleted:\t{s}\n", .{staged_changes.items[i].obj.name});
+    }
+
+    var unstaged_untracked_objs = try std.ArrayList(usize).initCapacity(allocator, 8);
+    defer unstaged_untracked_objs.deinit(allocator);
+
+    var unstaged_modified_objs = try std.ArrayList(usize).initCapacity(allocator, 8);
+    defer unstaged_modified_objs.deinit(allocator);
+
+    var unstaged_deleted_objs = try std.ArrayList(usize).initCapacity(allocator, 8);
+    defer unstaged_deleted_objs.deinit(allocator);
+
+
+    for (0..unstaged_changes.items.len) |i| {
+        switch (unstaged_changes.items[i].status) {
+            .untracked => try unstaged_untracked_objs.append(allocator, i),
+            .modified  => try unstaged_modified_objs.append(allocator, i),
+            .deleted   => try unstaged_deleted_objs.append(allocator, i),
+            else       => {}
         }
     }
 
-    if (untracked_objs.items.len > 0) {
-        debug.print("Untracked files:\n", .{});
-        for (untracked_objs.items) |i| {
-            debug.print("   {s}\n", .{all_status.items[i].name});
-        }
+    if (unstaged_changes.items.len > 0) debug.print("Unstaged changes:\n", .{});
+    for (unstaged_modified_objs.items) |i| {
+        debug.print("\tmodified:\t{s}\n", .{unstaged_changes.items[i].obj.name});
     }
 
-    if (deleted_objs.items.len > 0) {
-        debug.print("Deleted files:\n", .{});
-        for (deleted_objs.items) |i| {
-            debug.print("   {s}\n", .{all_status.items[i].name});
-        }
+    for (unstaged_untracked_objs.items) |i| {
+        debug.print("\tuntracked:\t{s}\n", .{unstaged_changes.items[i].obj.name});
+    }
+
+    for (unstaged_deleted_objs.items) |i| {
+        debug.print("\tdeleted:\t{s}\n", .{unstaged_changes.items[i].obj.name});
     }
 }
 
@@ -414,19 +464,64 @@ fn construct_tree_from_dir(allocator: mem.Allocator, parent: ?*Object, objs_dir:
     return root_obj;
 }
 
+fn construct_tree_from_index(allocator: mem.Allocator, index_file: fs.File) !?Object {
+    var root_obj = Object {.allocator = allocator, .name = &[0]u8{}, .kind = .tree };
+
+    var file_buf: [1024]u8 = undefined;
+    var r = index_file.reader(&file_buf);
+    var reader = &r.interface;
+
+    while (reader.takeDelimiter('\n')) |line| {
+        if (line) |l| {
+            var it = mem.splitScalar(u8, l, ' ');
+            const obj_hash = it.next().?;
+            const obj_name = it.next().?;
+
+
+            var parent_obj = &root_obj;
+            var it2 = mem.splitScalar(u8, obj_name, '/');
+            name_iter: while (it2.next()) |path| {
+                for (parent_obj.children) |*c| {
+                    if (mem.eql(u8, c.name, path)) {
+                        parent_obj = c;
+                        continue :name_iter;
+                    }
+                }
+                const kind: ObjectKind = if (it2.peek()) |_| .tree else .blob;
+                var obj = Object {.allocator = allocator, .name = &[0]u8{}, .kind = kind};
+                if (kind == .blob) obj.name = try fmt.allocPrint(obj.allocator, "{s}", .{path})
+                else obj.name = try fmt.allocPrint(obj.allocator, "{s}/", .{path});
+                if (kind == .blob) _ = try fmt.bufPrint(&obj.hash, "{s}", .{obj_hash});
+                obj.parent = parent_obj;
+
+                try parent_obj.add_child(obj);
+                if (kind == .tree) parent_obj = &parent_obj.children[parent_obj.children.len-1];
+            }
+        } else {
+            break;
+        }
+    } else |err| {
+        _ = err catch {};
+    }
+
+    try update_hashes(&root_obj);
+
+    if (root_obj.children.len == 0) return null;
+
+    return root_obj;
+}
+
 fn get_obj_from_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8, objs_dir: fs.Dir) !Object {
-    var it = mem.splitBackwardsScalar(u8, path, '/');
-    const name = it.next().?;
     const s = try cwd.statFile(path);
     if (s.kind == .file) {
         var f = try cwd.openFile(path, .{ .mode = .read_only });
         defer f.close();
-        const obj = try get_file_obj(allocator, null, name, f);
+        const obj = try get_file_obj(allocator, null, path, f);
         return obj;
     } else if (s.kind == .directory) {
         const subdir = try cwd.openDir(path, .{ .iterate = true });
 
-        const obj = construct_tree_from_dir(allocator, null, objs_dir, name, subdir);
+        const obj = construct_tree_from_dir(allocator, null, objs_dir, path, subdir);
         return obj;
     }
     return error.InvalidFileType;
@@ -466,65 +561,91 @@ fn get_file_obj(allocator: mem.Allocator, parent: ?*Object, name: []const u8, f:
     return obj;
 }
 
+fn get_children_blobs(allocator: mem.Allocator, tree: Object) ![]Object {
+    var blobs = try std.ArrayList(Object).initCapacity(allocator, 4);
+
+    for (tree.children) |c| {
+        if (c.kind == .blob) {
+            try blobs.append(allocator, c);
+        } else {
+            try blobs.appendSlice(allocator, try get_children_blobs(allocator, c));
+        }
+    }
+
+    return blobs.toOwnedSlice(allocator);
+}
+
+// TODO: print full path of objects
 fn dump_obj(t: Object) void {
-    debug.print("name: {s}\thash: {s}\n", .{t.name, t.hash});
+    debug.print("kind: {s}\thash: {s}\tname: {s}\n", .{@tagName(t.kind), t.hash, t.name});
     for (t.children) |c| {
+        debug.print("\t", .{});
         dump_obj(c);
     }
 }
 
-fn compare_current_tree_with_commit_tree(allocator: mem.Allocator, commit_tree: ?Object, current_tree: Object, all_status: *std.ArrayList(ObjectStatus)) !void {
-    if (commit_tree) |ct| {
-        if (mem.eql(u8, &ct.hash, &current_tree.hash)) return;
+fn compare_index_tree_with_commit_tree(allocator: mem.Allocator, index_tree: Object, commit_tree: ?Object, changes: *std.ArrayList(ObjectStatus)) !void {
+    if (commit_tree) |commit_tree_obj| {
+        if (mem.eql(u8, &commit_tree_obj.hash, &index_tree.hash)) return;
 
-        const m = ct.children.len;
-        const n = current_tree.children.len;
-        var dp = try allocator.alloc([]u32, m+1);
-        defer allocator.free(dp);
-        for (0..dp.len) |i| {
-            dp[i] = try allocator.alloc(u32, n+1);
-            @memset(dp[i], 0);
-        }
-        defer for (0..dp.len) |i| allocator.free(dp[i]);
+        const m = commit_tree_obj.children.len;
+        const n = index_tree.children.len;
 
-        for (1..m+1) |i| {
-            for (1..n+1) |j| {
-                if (mem.eql(u8, ct.children[i-1].name, current_tree.children[j-1].name)) {
-                    dp[i][j] = dp[i-1][j-1] + 1;
-                } else {
-                    dp[i][j] = @max(dp[i-1][j], dp[i][j-1]);
-                }
-            }
-        }
-
-        var i = m;
-        var j = n;
-        while (i > 0 and j > 0) {
-            if (i > 0 and j > 0 and mem.eql(u8, ct.children[i-1].name, current_tree.children[j-1].name)) {
-                if (!mem.eql(u8, &ct.children[i-1].hash, &current_tree.children[j-1].hash)) {
-                    if (current_tree.children[j-1].kind == .blob) {
-                        try all_status.append(allocator, .{ .name = current_tree.children[j-1].name, .status = .modified });
-                    } else if (current_tree.children[j-1].kind == .tree) {
-                            try compare_current_tree_with_commit_tree(allocator, ct.children[i-1], current_tree.children[j-1], all_status);
+        outer: for (0..m) |i| {
+            for (0..n) |j| {
+                if (mem.eql(u8, commit_tree_obj.children[i].name, index_tree.children[j].name)) {
+                    if (!mem.eql(u8, &commit_tree_obj.children[i].hash, &index_tree.children[j].hash)) {
+                        if (commit_tree_obj.children[i].kind == .blob) try changes.append(allocator, .{ .obj = commit_tree_obj.children[i], .status = .modified })
+                        else try compare_index_tree_with_commit_tree(allocator, commit_tree_obj.children[i], index_tree.children[j], changes);
                     }
+                    continue :outer;
                 }
-                i -= 1;
-                j -= 1;
-            } else if (j > 0 and (i == 0 or dp[i][j-1] >= dp[i-1][j])) {
-                try all_status.append(allocator, .{ .name = current_tree.children[j-1].name, .status = .untracked });
-                j -= 1;
-            } else {
-                try all_status.append(allocator, .{ .name = ct.children[i-1].name, .status = .deleted });
-                i -= 1;
             }
+            try changes.append(allocator, .{ .obj = commit_tree_obj.children[i], .status = .deleted });
+        }
+        outer: for (0..n) |j| {
+            for (0..m) |i| {
+                if (mem.eql(u8, commit_tree_obj.children[i].name, index_tree.children[j].name)) continue :outer;
+            }
+            try changes.append(allocator, .{ .obj = index_tree.children[j], .status = .untracked });
         }
     } else {
-        for (current_tree.children) |*c| {
-            if (c.kind == .blob) {
-                try all_status.append(allocator, .{ .name = c.name, .status = .untracked });
-            } else if (c.kind == .tree) {
-                try all_status.append(allocator, .{ .name = c.name, .status = .untracked });
+        for (index_tree.children) |c| {
+            if (c.kind == .blob) try changes.append(allocator, .{ .obj = c, .status = .untracked })
+            else try compare_index_tree_with_commit_tree(allocator, c, null, changes);
+
+        }
+    }
+}
+
+fn compare_index_tree_with_current_tree(allocator: mem.Allocator, index_tree: ?Object, current_tree: Object, changes: *std.ArrayList(ObjectStatus)) !void {
+    if (index_tree) |index_tree_obj| {
+        if (mem.eql(u8, &index_tree_obj.hash, &current_tree.hash)) return;
+
+        const m = index_tree_obj.children.len;
+        const n = current_tree.children.len;
+
+        outer: for (0..m) |i| {
+            for (0..n) |j| {
+                if (mem.eql(u8, index_tree_obj.children[i].name, current_tree.children[j].name)) {
+                    if (!mem.eql(u8, &index_tree_obj.children[i].hash, &current_tree.children[j].hash)) {
+                        if (index_tree_obj.children[i].kind == .blob) try changes.append(allocator, .{ .obj = index_tree_obj.children[i], .status = .modified })
+                        else try compare_index_tree_with_current_tree(allocator, index_tree_obj.children[i], current_tree.children[j], changes);
+                    }
+                    continue :outer;
+                }
             }
+            try changes.append(allocator, .{ .obj = index_tree_obj.children[i], .status = .deleted });
+        }
+        outer: for (0..n) |j| {
+            for (0..m) |i| {
+                if (mem.eql(u8, index_tree_obj.children[i].name, current_tree.children[j].name)) continue :outer;
+            }
+            try changes.append(allocator, .{ .obj = current_tree.children[j], .status = .untracked });
+        }
+    } else {
+        for (current_tree.children) |c| {
+            try changes.append(allocator, .{ .obj = c, .status = .untracked });
         }
     }
 }
@@ -636,7 +757,7 @@ fn write_indexed_objs(index_file: fs.File, objs: []Object) !void {
     var writer = &w.interface;
 
     for (objs) |o| {
-        try writer.print("{s} {s}\n", .{o.name, o.hash});
+        try writer.print("{s} {s}\n", .{o.hash, o.name});
         try writer.flush();
     }
 }
@@ -691,8 +812,8 @@ fn get_indexed_objs(allocator: mem.Allocator, index_file: fs.File) ![]Object {
     while (reader.takeDelimiter('\n')) |line| {
         if (line) |l| {
             var it = mem.splitScalar(u8, l, ' ');
-            const obj_name = it.next().?;
             const obj_hash = it.next().?;
+            const obj_name = it.next().?;
             var obj = Object {.allocator = allocator, .name = &[0]u8{}, .kind = .blob};
             obj.name = try fmt.allocPrint(obj.allocator, "{s}", .{obj_name});
             _ = try fmt.bufPrint(&obj.hash, "{s}", .{obj_hash});
@@ -706,6 +827,7 @@ fn get_indexed_objs(allocator: mem.Allocator, index_file: fs.File) ![]Object {
     return objs.toOwnedSlice(allocator);
 }
 
+// TODO: doesn't add modified/deleted files properly
 fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
@@ -736,13 +858,17 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     defer for (indexed_objs) |*o| o.deinit(); 
 
     var file_obj = try get_obj_from_path(allocator, cwd, full_path[root_path.len+1..], objs_dir);
-    defer file_obj.deinit();
 
     var is_present = false;
     for (0..indexed_objs.len) |i| {
         if (mem.eql(u8, indexed_objs[i].name, file_obj.name)) {
             is_present = true;
-            if (!mem.eql(u8, &indexed_objs[i].hash, &file_obj.hash)) _ = try fmt.bufPrint(&indexed_objs[i].hash, "{s}", .{file_obj.hash}) else return;
+            if (!mem.eql(u8, &indexed_objs[i].hash, &file_obj.hash)) {
+                _ = try fmt.bufPrint(&indexed_objs[i].hash, "{s}", .{file_obj.hash});
+            } else {
+                file_obj.deinit();
+                return;
+            }
             break;
         }
     }
@@ -750,6 +876,7 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     if (!is_present) {
         indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len + 1);
         indexed_objs[indexed_objs.len-1] = file_obj;
+        // TODO: insert in sorted order
     }
 
     try write_indexed_objs(index_file, indexed_objs);
