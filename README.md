@@ -14,7 +14,7 @@ A simple version control system written in [zig](https://ziglang.org/), built to
     - [x] View commit history
     - [ ] Patch working directory to committed snapshots
 - [ ] Object Compression: Reduce storage size of stored objects
-- [ ] Staging area
+- [x] Staging area
 - [ ] Diff Support: Show difference between working directory and previous commit
 
 ## Limitations
