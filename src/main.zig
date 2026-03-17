@@ -35,6 +35,19 @@ pub fn main() !void {
                 return;
             }
             try check_status(allocator, cwd);
+        } else if (mem.eql(u8, arg, "diff")) {
+            const arg2 = args.next();
+            if (arg2) |cmd| {
+                if (mem.eql(u8, cmd, "-h") or mem.eql(u8, cmd, "--help")) {
+                    debug.print("usage: vec diff <file>\n", .{});
+                    return;
+                }
+                try compare_file_with_indexed_obj(allocator, cwd, cmd);
+            } else {
+                debug.print("fatal: missing file path argument\n", .{});
+                debug.print("usage: vec add <file>\n", .{});
+                return;
+            }
         } else if (mem.eql(u8, arg, "add")) {
             const arg2 = args.next();
             if (arg2) |cmd| {
@@ -44,8 +57,8 @@ pub fn main() !void {
                 }
                 try add_to_index(allocator, cwd, cmd);
             } else {
-                debug.print("fatal: missing message\n", .{});
-                debug.print("usage: vec add <path>\n", .{});
+                debug.print("fatal: missing file path argument\n", .{});
+                debug.print("usage: vec add <file>\n", .{});
                 return;
             }
         } else if (mem.eql(u8, arg, "commit")) {
@@ -76,6 +89,8 @@ pub fn main() !void {
                 \\Available commands:
                 \\  init:   Create a working area
                 \\  status: Show the working tree status
+                \\  diff:   Show changes between working tree and commit
+                \\  add:    Add file contents to index
                 \\  commit: Record changes to the working area
                 \\  log:    Show commit logs
             ;
@@ -895,4 +910,257 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
 
     try write_indexed_objs(index_file, indexed_objs);
     try store_blob_obj(cwd, objs_dir, file_obj);
+}
+
+fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_path: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+    const root_path = try root_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
+
+    const full_path = try cwd.realpathAlloc(allocator, file_path);
+    defer allocator.free(full_path);
+    if (full_path.len < root_path.len or !std.mem.eql(u8, root_path, full_path[0..root_path.len])) {
+        debug.print("fatal: provided path '{s}' is outside working directory '{s}'\n", .{full_path, root_path});
+        process.exit(1);
+    }
+
+    const s = try cwd.statFile(file_path);
+    if (s.kind != .file) {
+        debug.print("fatal: provided path '{s}' is not a file\n", .{full_path});
+        process.exit(1);
+    }
+
+    const index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
+    const indexed_objs = try get_indexed_objs(allocator, index_file);
+    defer allocator.free(indexed_objs);
+    defer for (indexed_objs) |*o| o.deinit(); 
+
+    var is_indexed = false;
+    var index: usize = 0;
+    for (0..indexed_objs.len) |i| {
+        if (mem.eql(u8, indexed_objs[i].name, file_path)) {
+            is_indexed = true;
+            index = i;
+        }
+    }
+    if (!is_indexed) {
+        return;
+    }
+
+    var committed_file = try objs_dir.openFile(&indexed_objs[index].hash, .{ .mode = .read_only });
+    defer committed_file.close();
+    var current_file = try root_dir.openFile(file_path, .{ .mode = .read_only });
+    defer current_file.close();
+
+    var buf: [2][1024*1024]u8 = undefined;
+    var file_readers = [_]fs.File.Reader {
+        committed_file.reader(&buf[0]),
+        current_file.reader(&buf[1])
+    };
+
+    var stdout_buf: [1024*1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    const stdout = &stdout_writer.interface;
+
+    _ = try myers_diff(@constCast(stdout), allocator, &file_readers);
+}
+
+const EditGraph = struct {
+    const Self = @This();
+    items: []u32,
+    edits: u32,
+    max: usize,
+
+    pub fn init(gpa: std.mem.Allocator, max: usize) !Self {
+        var self = Self {.items = &[_]u32{}, .edits = undefined, .max = max};
+        self.items = try gpa.alloc(u32, 2*max+1);
+        @memset(self.items, 0);
+        return self;
+    }
+    pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+        gpa.free(self.items);
+    }
+    pub fn get(self: *Self, i: i64) u32 {
+        const idx: usize = @intCast(i + @as(i32, @intCast(self.max)));
+        std.debug.assert(idx >= 0 and idx < 2*self.max+1);
+        return self.items[idx];
+    }
+    pub fn set(self: *Self, i: i64, val: u32) void {
+        const idx: usize = @intCast(i + @as(i32, @intCast(self.max)));
+        std.debug.assert(idx >= 0 and idx < 2*self.max+1);
+        self.items[idx] = val;
+    }
+    pub fn clone(self: *Self, gpa: std.mem.Allocator) !Self {
+        var new = Self {.items = &[_]u32{}, .edits = self.edits, .max = self.max};
+        new.items = try gpa.dupe(u32, self.items);
+        return new;
+    }
+};
+
+const Operation = enum {
+    ADD,
+    SUB
+};
+
+const add_prefix = "> ";
+const sub_prefix = "< ";
+
+fn myers_diff(stdout: *std.Io.Writer, allocator: std.mem.Allocator, file_readers: *[2]std.fs.File.Reader) !bool {
+    const readers = [_]*std.Io.Reader {
+        &file_readers[0].interface,
+        &file_readers[1].interface,
+    };
+
+    var file_contents = [_]std.ArrayList([]u8) {
+        try std.ArrayList([]u8).initCapacity(allocator, 16),
+        try std.ArrayList([]u8).initCapacity(allocator, 16),
+    };
+    defer file_contents[0].deinit(allocator);
+    defer file_contents[1].deinit(allocator);
+
+    while (readers[0].takeDelimiterInclusive('\n')) |l| {
+        const line = l[0..l.len-1];
+        try file_contents[0].append(allocator, line);
+    } else |err| {
+        _ = err catch {};
+    }
+    while (readers[1].takeDelimiterInclusive('\n')) |l| {
+        const line = l[0..l.len-1];
+        try file_contents[1].append(allocator, line);
+    } else |err| {
+        _ = err catch {};
+    }
+
+    const m = file_contents[0].items.len;
+    const n = file_contents[1].items.len;
+    const max = m + n;
+
+    var edit_graph = try EditGraph.init(allocator, max);
+    defer edit_graph.deinit(allocator);
+
+    var trace = try std.ArrayList(EditGraph).initCapacity(allocator, 16);
+
+    var d: i64 = 0;
+    outer: while (d <= max) {
+        var k = -d;
+        try trace.append(allocator, try edit_graph.clone(allocator));
+        while (k <= d) {
+            var x: i64 = undefined;
+            if (k == -d or (k != d and edit_graph.get(k-1) < edit_graph.get(k+1))) {
+                x = edit_graph.get(k + 1);
+            } else {
+                x = edit_graph.get(k - 1) + 1;
+            }
+            var y = x - k;
+
+            while (x < m and y < n and std.mem.eql(u8, file_contents[0].items[@as(usize, @intCast(x))], file_contents[1].items[@as(usize, @intCast(y))])) {
+                x += 1;
+                y += 1;
+            }
+
+            edit_graph.set(k, @intCast(x));
+
+            if (x >= m and y >= n) {
+                edit_graph.edits = @intCast(d);
+                break :outer;
+            }
+
+            k += 2;
+        }
+        d += 1;
+    }
+
+    var edit_ops = try std.ArrayList(Operation).initCapacity(allocator, 16);
+    defer edit_ops.deinit(allocator);
+
+    var edited_x = try std.ArrayList(i64).initCapacity(allocator, 16);
+    defer edited_x.deinit(allocator);
+
+    var edited_k = try std.ArrayList(i64).initCapacity(allocator, 16);
+    defer edited_k.deinit(allocator);
+
+    var x: i64 = @intCast(m);
+    var y: i64 = @intCast(n);
+    d = @intCast(trace.items.len-1);
+    while (d >= 0) {
+        var v = trace.items[@as(usize, @intCast(d))];
+        const k = x - y;
+        var op: Operation = undefined; 
+
+        var prev_k: i64 = undefined;
+        if (k == -d or (k != d and v.get(k-1) < v.get(k + 1))) {
+            prev_k = k + 1;
+            op = .ADD;
+        } else {
+            prev_k = k - 1;
+            op = .SUB;
+        }
+
+        const prev_x = v.get(prev_k);
+        const prev_y = prev_x - prev_k;
+
+        while (x > prev_x and y > prev_y) {
+            x -= 1;
+            y -= 1;
+        }
+
+        if (x == 0 or y == 0) break;
+
+        try edited_x.append(allocator, x);
+        try edited_k.append(allocator, k);
+        if (op == .ADD) {
+            try edit_ops.append(allocator, .ADD);
+            y -= 1;
+        } else {
+            try edit_ops.append(allocator, .SUB);
+            x -= 1;
+        }
+
+        d -= 1;
+    }
+
+    if (edit_ops.items.len == 0) return false;
+
+    std.mem.reverse(Operation, edit_ops.items);
+    std.mem.reverse(i64, edited_x.items);
+    std.mem.reverse(i64, edited_k.items);
+    var i: usize = 0;
+    while (i < edit_ops.items.len) {
+        const x_ = edited_x.items[i];
+        const k_ = edited_k.items[i];
+        const y_ = x_ - k_;
+        if (edit_ops.items[i] == .ADD) {
+            try stdout.print("{d}a{d}\n", .{x_, y_});
+            try stdout.print("{s}{s}\n", .{add_prefix, file_contents[1].items[@as(usize, @intCast(y_))-1]});
+        } else {
+            if (i + 1 < edit_ops.items.len and edit_ops.items[i+1] == .ADD and edited_x.items[i+1] == x_ and edited_k.items[i+1] == k_-1) {
+                try stdout.print("{d}c{d}\n", .{x_, edited_x.items[i+1]-edited_k.items[i+1]});
+                try stdout.print("{s}{s}\n", .{sub_prefix, file_contents[0].items[@as(usize, @intCast(x_))-1]});
+                try stdout.print("---\n", .{});
+                try stdout.print("{s}{s}\n", .{add_prefix, file_contents[1].items[@as(usize, @intCast(y_))-1]});
+                i += 1;
+            } else {
+                try stdout.print("{d}d{d}\n", .{x_, y_});
+                try stdout.print("{s}{s}\n", .{sub_prefix, file_contents[0].items[@as(usize, @intCast(x_))-1]});
+            }
+        }
+        try stdout.flush();
+        i += 1;
+    }
+
+    try file_readers[0].seekTo(0);
+    try file_readers[1].seekTo(0);
+
+    for (trace.items) |*v| {
+        v.deinit(allocator);
+    }
+    trace.deinit(allocator);
+
+    return true;
 }
