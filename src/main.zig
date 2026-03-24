@@ -981,6 +981,8 @@ fn compare_commits(allocator: mem.Allocator, cwd: fs.Dir, commit1: []const u8, c
             var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
             const stdout = &stdout_writer.interface;
 
+            try stdout.print("{s}\n", .{changes.items[i].obj1.name});
+            try stdout.flush();
             _ = try myers_diff(@constCast(stdout), allocator, &file_readers);
         }
     }
