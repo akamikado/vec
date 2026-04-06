@@ -68,6 +68,19 @@ pub fn main() !void {
                 debug.print("usage: vec add <file>\n", .{});
                 return;
             }
+        } else if (mem.eql(u8, arg, "restore")) {
+            const arg2 = args.next();
+            if (arg2) |cmd| {
+                if (mem.eql(u8, cmd, "-h") or mem.eql(u8, cmd, "--help")) {
+                    debug.print("usage: vec restore <file>\n", .{});
+                    return;
+                }
+                try restore_file(allocator, cwd, cmd);
+            } else {
+                debug.print("fatal: missing file path argument\n", .{});
+                debug.print("usage: vec restore <file>\n", .{});
+                return;
+            }
         } else if (mem.eql(u8, arg, "commit")) {
             const arg2 = args.next();
             if (arg2) |cmd| {
@@ -261,6 +274,14 @@ const Object = struct {
         self.children = new_children;
         return true;
     }
+
+    fn compare_name(ctx: @This(), item: @This()) std.math.Order {
+        return mem.order(u8, ctx.name, item.name);
+    }
+
+    fn lessThanFn(_: void, a: @This(), b: @This()) bool {
+        return mem.order(u8, a.name, b.name) == .lt;
+    }
 };
 
 fn update_hashes(obj: *Object) !void {
@@ -320,7 +341,6 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
 
     var unstaged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
     defer unstaged_changes.deinit(allocator);
-
 
     if (index_tree) |t| try compare_index_tree_with_commit_tree(allocator, t, commit_tree, &staged_changes);
     try compare_index_tree_with_current_tree(allocator, index_tree, current_tree, &unstaged_changes);
@@ -433,6 +453,7 @@ fn construct_tree_from_hash(allocator: mem.Allocator, objs_dir: fs.Dir, hash: ?[
         } else |err| {
             _ = err catch {};
         }
+        mem.sort(Object, root_obj.children, {}, Object.lessThanFn);
         return root_obj;
     }
     return null;
@@ -463,18 +484,21 @@ fn construct_tree_from_dir(allocator: mem.Allocator, parent: ?*Object, name: []c
             defer subdir.close();
             const obj = try construct_tree_from_dir(allocator, &root_obj, e.name, subdir);
             if (obj.children.len > 0) {
-                hasher.update(&obj.hash);
                 try root_obj.add_child(obj);
             }
         } else if (e.kind == .file) {
             var f = try d.openFile(e.name, .{ .mode = .read_only });
             defer f.close();
             const obj = try get_file_obj(allocator, &root_obj, e.name, f);
-            hasher.update(&obj.hash);
             try root_obj.add_child(obj);
         }
 
         entry = try it.next();
+    }
+    mem.sort(Object, root_obj.children, {}, Object.lessThanFn);
+
+    for (root_obj.children) |c| {
+        hasher.update(&c.hash);
     }
 
     const hash_bytes = hasher.finalResult();
@@ -498,14 +522,20 @@ fn construct_tree_from_index(allocator: mem.Allocator, index_file: fs.File) !?Ob
             const obj_hash = it.next().?;
             const obj_name = it.next().?;
 
-
             var parent_obj = &root_obj;
             var it2 = mem.splitScalar(u8, obj_name, '/');
             name_iter: while (it2.next()) |path| {
                 for (parent_obj.children) |*c| {
-                    if (mem.eql(u8, c.name, path)) {
-                        parent_obj = c;
-                        continue :name_iter;
+                    if (c.kind == .blob) {
+                        if (mem.eql(u8, c.name, path)) {
+                            parent_obj = c;
+                            continue :name_iter;
+                        }
+                    } else {
+                        if (mem.eql(u8, c.name[0..c.name.len-1], path)) {
+                            parent_obj = c;
+                            continue :name_iter;
+                        }
                     }
                 }
                 const kind: ObjectKind = if (it2.peek()) |_| .tree else .blob;
@@ -629,7 +659,7 @@ fn compare_index_tree_with_commit_tree(allocator: mem.Allocator, index_tree: Obj
                 if (mem.eql(u8, commit_tree_obj.children[i].name, index_tree.children[j].name)) {
                     if (!mem.eql(u8, &commit_tree_obj.children[i].hash, &index_tree.children[j].hash)) {
                         if (commit_tree_obj.children[i].kind == .blob) try changes.append(allocator, .{ .obj1 = commit_tree_obj.children[i], .obj2 = index_tree.children[j], .status = .modified })
-                        else try compare_index_tree_with_commit_tree(allocator, commit_tree_obj.children[i], index_tree.children[j], changes);
+                        else try compare_index_tree_with_commit_tree(allocator, index_tree.children[j], commit_tree_obj.children[i], changes);
                     }
                     continue :outer;
                 }
@@ -731,14 +761,6 @@ fn snapshot_tree(allocator: mem.Allocator, cwd:fs.Dir, tree: Object, msg: []cons
 
 fn store_blob_obj(working_dir: fs.Dir, objs_dir: fs.Dir, blob_obj: Object) !void {
     const blob_file_name = blob_obj.hash;
-    if (objs_dir.access(&blob_file_name, .{})) {
-        return;
-    } else |err| {
-        switch (err) {
-            error.FileNotFound => {},
-            else => return err
-        }
-    }
     try fs.Dir.copyFile(working_dir, blob_obj.name, objs_dir, &blob_file_name, .{});
 }
 
@@ -909,29 +931,73 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
 
     var file_obj = try get_obj_from_path(allocator, cwd, full_path[root_path.len+1..]);
 
-    var is_present = false;
-    for (0..indexed_objs.len) |i| {
-        if (mem.eql(u8, indexed_objs[i].name, file_obj.name)) {
-            is_present = true;
-            if (!mem.eql(u8, &indexed_objs[i].hash, &file_obj.hash)) {
-                _ = try fmt.bufPrint(&indexed_objs[i].hash, "{s}", .{file_obj.hash});
-                file_obj.deinit();
-            } else {
-                file_obj.deinit();
-                return;
-            }
-            break;
-        }
-    }
+    const idx = std.sort.upperBound(Object, indexed_objs, file_obj, Object.compare_name);
+    if (idx < indexed_objs.len) {
+        if (mem.eql(u8, indexed_objs[idx].name, file_obj.name)) {
+            file_obj.deinit();
+            if (!mem.eql(u8, &indexed_objs[idx].hash, &file_obj.hash))
+                _ = try fmt.bufPrint(&indexed_objs[idx].hash, "{s}", .{file_obj.hash})
+            else return;
 
-    if (!is_present) {
+        } else {
+            indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len + 1);
+            var i = indexed_objs.len - 1;
+            while (i > idx) {
+                indexed_objs[i] = indexed_objs[i-1];
+                i -= 1;
+            }
+            indexed_objs[idx] = file_obj;
+        }
+    } else {
         indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len + 1);
-        indexed_objs[indexed_objs.len-1] = file_obj;
-        // TODO: insert in sorted order
+        indexed_objs[idx] = file_obj;
     }
 
     try write_indexed_objs(index_file, indexed_objs);
     try store_blob_obj(cwd, objs_dir, file_obj);
+}
+
+fn restore_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+    const root_path = try root_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    const full_path = try cwd.realpathAlloc(allocator, path);
+    defer allocator.free(full_path);
+
+    if (full_path.len < root_path.len or !std.mem.eql(u8, root_path, full_path[0..root_path.len])) {
+        debug.print("fatal: provided path '{s}' is outside working directory '{s}'\n", .{full_path, root_path});
+        process.exit(1);
+    }
+
+    const s = try cwd.statFile(path);
+    if (s.kind != .file) {
+        debug.print("fatal: provided path '{s}' is not a file\n", .{full_path});
+        process.exit(1);
+    }
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
+
+    const index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
+    const indexed_objs = try get_indexed_objs(allocator, index_file);
+    defer allocator.free(indexed_objs);
+    defer for (indexed_objs) |*o| o.deinit(); 
+
+    var file_obj = try get_obj_from_path(allocator, cwd, full_path[root_path.len+1..]);
+    defer file_obj.deinit();
+
+    for (0..indexed_objs.len) |i| {
+        if (mem.eql(u8, indexed_objs[i].name, file_obj.name)) {
+            if (!mem.eql(u8, &indexed_objs[i].hash, &file_obj.hash)) {
+                try fs.Dir.copyFile(objs_dir, &indexed_objs[i].hash, cwd, full_path[root_path.len+1..], .{});
+            }
+            return;
+        }
+    }
 }
 
 fn compare_commits(allocator: mem.Allocator, cwd: fs.Dir, commit1: []const u8, commit2: []const u8) !void {
