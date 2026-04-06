@@ -1,11 +1,13 @@
-const std = @import("std");
-const debug = std.debug;
-const mem = std.mem;
-const fs = std.fs;
-const heap = std.heap;
-const crypto = std.crypto;
+const std     = @import("std");
+const debug   = std.debug;
+const mem     = std.mem;
+const fs      = std.fs;
+const heap    = std.heap;
+const crypto  = std.crypto;
 const process = std.process;
-const fmt = std.fmt;
+const fmt     = std.fmt;
+const math    = std.math;
+const sort    = std.sort;
 
 pub fn main() !void {
     var args = process.args();
@@ -275,8 +277,12 @@ const Object = struct {
         return true;
     }
 
-    fn compare_name(ctx: @This(), item: @This()) std.math.Order {
+    fn compare_objs_by_name(ctx: @This(), item: @This()) math.Order {
         return mem.order(u8, ctx.name, item.name);
+    }
+
+    fn compare_obj_to_name(ctx: []u8, item: @This()) math.Order {
+        return mem.order(u8, ctx, item.name);
     }
 
     fn lessThanFn(_: void, a: @This(), b: @This()) bool {
@@ -517,6 +523,7 @@ fn construct_tree_from_index(allocator: mem.Allocator, index_file: fs.File) !?Ob
     var reader = &r.interface;
 
     while (reader.takeDelimiter('\n')) |line| {
+        // TODO: make this logic simpler, because lines are sorted by name
         if (line) |l| {
             var it = mem.splitScalar(u8, l, ' ');
             const obj_hash = it.next().?;
@@ -913,7 +920,7 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
 
     const full_path = try cwd.realpathAlloc(allocator, path);
     defer allocator.free(full_path);
-    if (full_path.len < root_path.len or !std.mem.eql(u8, root_path, full_path[0..root_path.len])) {
+    if (full_path.len < root_path.len or !mem.eql(u8, root_path, full_path[0..root_path.len])) {
         debug.print("fatal: provided path '{s}' is outside working directory '{s}'\n", .{full_path, root_path});
         process.exit(1);
     }
@@ -931,7 +938,7 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
 
     var file_obj = try get_obj_from_path(allocator, cwd, full_path[root_path.len+1..]);
 
-    const idx = std.sort.upperBound(Object, indexed_objs, file_obj, Object.compare_name);
+    const idx = sort.upperBound(Object, indexed_objs, file_obj, Object.compare_objs_by_name);
     if (idx < indexed_objs.len) {
         if (mem.eql(u8, indexed_objs[idx].name, file_obj.name)) {
             file_obj.deinit();
@@ -965,7 +972,7 @@ fn restore_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     const full_path = try cwd.realpathAlloc(allocator, path);
     defer allocator.free(full_path);
 
-    if (full_path.len < root_path.len or !std.mem.eql(u8, root_path, full_path[0..root_path.len])) {
+    if (full_path.len < root_path.len or !mem.eql(u8, root_path, full_path[0..root_path.len])) {
         debug.print("fatal: provided path '{s}' is outside working directory '{s}'\n", .{full_path, root_path});
         process.exit(1);
     }
@@ -990,13 +997,10 @@ fn restore_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     var file_obj = try get_obj_from_path(allocator, cwd, full_path[root_path.len+1..]);
     defer file_obj.deinit();
 
-    for (0..indexed_objs.len) |i| {
-        if (mem.eql(u8, indexed_objs[i].name, file_obj.name)) {
-            if (!mem.eql(u8, &indexed_objs[i].hash, &file_obj.hash)) {
-                try fs.Dir.copyFile(objs_dir, &indexed_objs[i].hash, cwd, full_path[root_path.len+1..], .{});
-            }
-            return;
-        }
+    const file_indexed_obj_idx = sort.binarySearch(Object, indexed_objs, file_obj, Object.compare_objs_by_name);
+    if (file_indexed_obj_idx) |idx| {
+        if (!mem.eql(u8, &indexed_objs[idx].hash, &file_obj.hash)) 
+                try fs.Dir.copyFile(objs_dir, &indexed_objs[idx].hash, cwd, full_path[root_path.len+1..], .{});
     }
 }
 
@@ -1044,7 +1048,7 @@ fn compare_commits(allocator: mem.Allocator, cwd: fs.Dir, commit1: []const u8, c
             };
 
             var stdout_buf: [1024*1024]u8 = undefined;
-            var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+            var stdout_writer = fs.File.stdout().writer(&stdout_buf);
             const stdout = &stdout_writer.interface;
 
             try stdout.print("{s}\n", .{changes.items[i].obj1.name});
@@ -1067,7 +1071,7 @@ fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_pat
 
     const full_path = try cwd.realpathAlloc(allocator, file_path);
     defer allocator.free(full_path);
-    if (full_path.len < root_path.len or !std.mem.eql(u8, root_path, full_path[0..root_path.len])) {
+    if (full_path.len < root_path.len or !mem.eql(u8, root_path, full_path[0..root_path.len])) {
         debug.print("fatal: provided path '{s}' is outside working directory '{s}'\n", .{full_path, root_path});
         process.exit(1);
     }
@@ -1083,17 +1087,10 @@ fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_pat
     defer allocator.free(indexed_objs);
     defer for (indexed_objs) |*o| o.deinit(); 
 
-    var is_indexed = false;
     var index: usize = 0;
-    for (0..indexed_objs.len) |i| {
-        if (mem.eql(u8, indexed_objs[i].name, file_path)) {
-            is_indexed = true;
-            index = i;
-        }
-    }
-    if (!is_indexed) {
-        return;
-    }
+    if (sort.binarySearch(Object, indexed_objs, file_path, Object.compare_obj_to_name)) |i| {
+        index = i;
+    } else return;
 
     var committed_file = try objs_dir.openFile(&indexed_objs[index].hash, .{ .mode = .read_only });
     defer committed_file.close();
@@ -1107,7 +1104,7 @@ fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_pat
     };
 
     var stdout_buf: [1024*1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = fs.File.stdout().writer(&stdout_buf);
     const stdout = &stdout_writer.interface;
 
     _ = try myers_diff(@constCast(stdout), allocator, &file_readers);
@@ -1119,26 +1116,26 @@ const EditGraph = struct {
     edits: u32,
     max: usize,
 
-    pub fn init(gpa: std.mem.Allocator, max: usize) !Self {
+    pub fn init(gpa: mem.Allocator, max: usize) !Self {
         var self = Self {.items = &[_]u32{}, .edits = undefined, .max = max};
         self.items = try gpa.alloc(u32, 2*max+1);
         @memset(self.items, 0);
         return self;
     }
-    pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *Self, gpa: mem.Allocator) void {
         gpa.free(self.items);
     }
     pub fn get(self: *Self, i: i64) u32 {
         const idx: usize = @intCast(i + @as(i32, @intCast(self.max)));
-        std.debug.assert(idx >= 0 and idx < 2*self.max+1);
+        debug.assert(idx >= 0 and idx < 2*self.max+1);
         return self.items[idx];
     }
     pub fn set(self: *Self, i: i64, val: u32) void {
         const idx: usize = @intCast(i + @as(i32, @intCast(self.max)));
-        std.debug.assert(idx >= 0 and idx < 2*self.max+1);
+        debug.assert(idx >= 0 and idx < 2*self.max+1);
         self.items[idx] = val;
     }
-    pub fn clone(self: *Self, gpa: std.mem.Allocator) !Self {
+    pub fn clone(self: *Self, gpa: mem.Allocator) !Self {
         var new = Self {.items = &[_]u32{}, .edits = self.edits, .max = self.max};
         new.items = try gpa.dupe(u32, self.items);
         return new;
@@ -1153,7 +1150,7 @@ const Operation = enum {
 const add_prefix = "> ";
 const sub_prefix = "< ";
 
-fn myers_diff(stdout: *std.Io.Writer, allocator: std.mem.Allocator, file_readers: *[2]std.fs.File.Reader) !bool {
+fn myers_diff(stdout: *std.Io.Writer, allocator: mem.Allocator, file_readers: *[2]fs.File.Reader) !bool {
     const readers = [_]*std.Io.Reader {
         &file_readers[0].interface,
         &file_readers[1].interface,
@@ -1201,7 +1198,7 @@ fn myers_diff(stdout: *std.Io.Writer, allocator: std.mem.Allocator, file_readers
             }
             var y = x - k;
 
-            while (x < m and y < n and std.mem.eql(u8, file_contents[0].items[@as(usize, @intCast(x))], file_contents[1].items[@as(usize, @intCast(y))])) {
+            while (x < m and y < n and mem.eql(u8, file_contents[0].items[@as(usize, @intCast(x))], file_contents[1].items[@as(usize, @intCast(y))])) {
                 x += 1;
                 y += 1;
             }
@@ -1269,9 +1266,9 @@ fn myers_diff(stdout: *std.Io.Writer, allocator: std.mem.Allocator, file_readers
 
     if (edit_ops.items.len == 0) return false;
 
-    std.mem.reverse(Operation, edit_ops.items);
-    std.mem.reverse(i64, edited_x.items);
-    std.mem.reverse(i64, edited_k.items);
+    mem.reverse(Operation, edit_ops.items);
+    mem.reverse(i64, edited_x.items);
+    mem.reverse(i64, edited_k.items);
     var i: usize = 0;
     while (i < edit_ops.items.len) {
         const x_ = edited_x.items[i];
