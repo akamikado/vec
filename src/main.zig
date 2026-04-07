@@ -61,13 +61,13 @@ pub fn main() !void {
             const arg2 = args.next();
             if (arg2) |cmd| {
                 if (mem.eql(u8, cmd, "-h") or mem.eql(u8, cmd, "--help")) {
-                    debug.print("usage: vec add <file>\n", .{});
+                    debug.print("usage: vec add <path>\n", .{});
                     return;
                 }
                 try add_to_index(allocator, cwd, cmd);
             } else {
-                debug.print("fatal: missing file path argument\n", .{});
-                debug.print("usage: vec add <file>\n", .{});
+                debug.print("fatal: missing path argument\n", .{});
+                debug.print("usage: vec add <path>\n", .{});
                 return;
             }
         } else if (mem.eql(u8, arg, "restore")) {
@@ -281,7 +281,7 @@ const Object = struct {
         return mem.order(u8, ctx.name, item.name);
     }
 
-    fn compare_obj_to_name(ctx: []u8, item: @This()) math.Order {
+    fn compare_obj_to_name(ctx: []const u8, item: @This()) math.Order {
         return mem.order(u8, ctx, item.name);
     }
 
@@ -768,7 +768,16 @@ fn snapshot_tree(allocator: mem.Allocator, cwd:fs.Dir, tree: Object, msg: []cons
 
 fn store_blob_obj(working_dir: fs.Dir, objs_dir: fs.Dir, blob_obj: Object) !void {
     const blob_file_name = blob_obj.hash;
-    try fs.Dir.copyFile(working_dir, blob_obj.name, objs_dir, &blob_file_name, .{});
+    if (objs_dir.access(&blob_file_name, .{})) {
+        return;
+    } else |err| {
+        switch (err) {
+            error.FileNotFound => {
+                try fs.Dir.copyFile(working_dir, blob_obj.name, objs_dir, &blob_file_name, .{});
+            },
+            else => return err
+        }
+    }
 }
 
 fn store_tree_obj(working_dir: fs.Dir, objs_dir: fs.Dir, tree_obj: Object) !void {
@@ -912,11 +921,6 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     const root_path = try root_dir.realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
-    defer vec_dir.close();
-
-    var objs_dir = try vec_dir.openDir("objects", .{});
-    defer objs_dir.close();
 
     const full_path = try cwd.realpathAlloc(allocator, path);
     defer allocator.free(full_path);
@@ -926,37 +930,57 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     }
 
     const s = try cwd.statFile(path);
-    if (s.kind != .file) {
-        debug.print("fatal: provided path '{s}' is not a file\n", .{full_path});
-        process.exit(1);
+    if (s.kind == .file) {
+        try add_file_to_index(allocator, cwd, full_path[root_path.len+1..]);
+        return;
+    } else if (s.kind != .directory) return;
+
+    var dir = try cwd.openDir(full_path[root_path.len+1..], .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    var entry = try it.next();
+    while (entry) |e| {
+        const child_full_path = try dir.realpathAlloc(allocator, e.name);
+        defer allocator.free(child_full_path); 
+        if (e.kind == .directory) 
+            try add_to_index(allocator,  cwd, child_full_path[root_path.len+1..])
+        else if (e.kind == .file) 
+            try add_file_to_index(allocator, cwd, child_full_path[root_path.len+1..]);
+        entry = try it.next();
     }
+}
+
+fn add_file_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
 
     const index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
     var indexed_objs = try get_indexed_objs(allocator, index_file);
     defer allocator.free(indexed_objs);
     defer for (indexed_objs) |*o| o.deinit(); 
 
-    var file_obj = try get_obj_from_path(allocator, cwd, full_path[root_path.len+1..]);
+    var file_obj = try get_obj_from_path(allocator, cwd, path);
 
-    const idx = sort.upperBound(Object, indexed_objs, file_obj, Object.compare_objs_by_name);
-    if (idx < indexed_objs.len) {
-        if (mem.eql(u8, indexed_objs[idx].name, file_obj.name)) {
+    if (sort.binarySearch(Object, indexed_objs, file_obj, Object.compare_objs_by_name)) |idx| {
             file_obj.deinit();
             if (!mem.eql(u8, &indexed_objs[idx].hash, &file_obj.hash))
                 _ = try fmt.bufPrint(&indexed_objs[idx].hash, "{s}", .{file_obj.hash})
             else return;
-
-        } else {
-            indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len + 1);
+    } else {
+        const idx = sort.upperBound(Object, indexed_objs, file_obj, Object.compare_objs_by_name);
+        indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len + 1);
+        if (idx < indexed_objs.len - 1) {
             var i = indexed_objs.len - 1;
             while (i > idx) {
                 indexed_objs[i] = indexed_objs[i-1];
                 i -= 1;
             }
-            indexed_objs[idx] = file_obj;
         }
-    } else {
-        indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len + 1);
         indexed_objs[idx] = file_obj;
     }
 
