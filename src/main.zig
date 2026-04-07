@@ -49,6 +49,7 @@ pub fn main() !void {
                         debug.print("       vec diff <commit> <commit>\n", .{});
                         return;
                     }
+                    // TODO: allow for comparison of directories
                     try compare_file_with_indexed_obj(allocator, cwd, a2);
                 }
             } else {
@@ -77,6 +78,7 @@ pub fn main() !void {
                     debug.print("usage: vec restore <file>\n", .{});
                     return;
                 }
+                // TODO: allow for restore of directories
                 try restore_file(allocator, cwd, cmd);
             } else {
                 debug.print("fatal: missing file path argument\n", .{});
@@ -131,7 +133,7 @@ fn get_root_dir(cwd: fs.Dir) !fs.Dir {
 
     var found_root_dir = if(cwd.access(".vec/", .{.mode = .read_only})) |_| true else |_| false;
     while (!found_root_dir and !mem.eql(u8, cwd_path, "/")) {
-        dir = try dir.openDir("..", .{});
+        dir = try dir.openDir("..", .{.iterate = true});
         cwd_path = try dir.realpath(".", &path_buf);
         found_root_dir = if(dir.access(".vec/", .{.mode = .read_only})) |_| true else |_| false;
     }
