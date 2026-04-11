@@ -14,9 +14,9 @@ A simple version control system written in [zig](https://ziglang.org/), built to
 - Restore: Restore file to previous snapshot version
 
 ## Planned Features
-- [ ] Staging area
+- [x] Staging area
     - [x] Stage files
-    - [ ] Unstage files
+    - [x] Unstage files
 - [x] Diff Support: Show difference between current state of file and state of the file in previous commit
 - [ ] Commit History
     - [x] View commit history
