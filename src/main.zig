@@ -72,27 +72,36 @@ pub fn main() !void {
                 return;
             }
         } else if (mem.eql(u8, arg, "restore")) {
-            const arg2 = args.next();
-            if (arg2) |cmd| {
-                if (mem.eql(u8, cmd, "-h") or mem.eql(u8, cmd, "--help")) {
+            if (args.next()) |arg2| {
+                if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
                     debug.print("usage: vec restore <file>\n", .{});
                     return;
+                } else if (mem.eql(u8, arg2, "--staged")) {
+                    if (args.next()) |arg3| {
+                        // TODO: allow for directories
+                        try restore_index_for_file(allocator, cwd, arg3);
+                    } else {
+                        debug.print("fatal: missing file path argument\n", .{});
+                        debug.print("usage: vec restore --staged <file>\n", .{});
+                    }
+                    return;
+                } else {
+                    // TODO: allow for restore of directories
+                    try restore_file(allocator, cwd, arg2);
                 }
-                // TODO: allow for restore of directories
-                try restore_file(allocator, cwd, cmd);
             } else {
                 debug.print("fatal: missing file path argument\n", .{});
                 debug.print("usage: vec restore <file>\n", .{});
+                debug.print("       vec restore --staged <file>\n", .{});
                 return;
             }
         } else if (mem.eql(u8, arg, "commit")) {
-            const arg2 = args.next();
-            if (arg2) |cmd| {
-                if (mem.eql(u8, cmd, "-h") or mem.eql(u8, cmd, "--help")) {
+            if (args.next()) |arg2| {
+                if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
                     debug.print("usage: vec log\n", .{});
                     return;
                 }
-                try snapshot_index(allocator, cwd, cmd);
+                try snapshot_index(allocator, cwd, arg2);
             } else {
                 debug.print("fatal: missing message\n", .{});
                 debug.print("usage: vec commit <message>\n", .{});
@@ -172,7 +181,7 @@ fn init_vec_dir(root_dir: fs.Dir) !void {
     };
 }
 
-fn get_head(_: mem.Allocator, vec_dir: fs.Dir) !?[40]u8 {
+fn get_head(vec_dir: fs.Dir) !?[40]u8 {
     var head_file_buf: [64]u8 = undefined;
     const head_file = try vec_dir.openFile("HEAD", .{});
     var r = head_file.reader(&head_file_buf);
@@ -328,7 +337,7 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var objs_dir = try vec_dir.openDir("objects", .{});
     defer objs_dir.close();
 
-    const head = try get_head(allocator, vec_dir);
+    const head = try get_head(vec_dir);
     const tree = try get_tree_for_commit(allocator, objs_dir, head);
     defer if (tree) |t| allocator.free(t);
 
@@ -753,7 +762,7 @@ fn snapshot_tree(allocator: mem.Allocator, cwd:fs.Dir, tree: Object, msg: []cons
     var objs_dir = try vec_dir.openDir("objects", .{});
     defer objs_dir.close();
 
-    const head = try get_head(allocator, vec_dir);
+    const head = try get_head(vec_dir);
     const head_tree = try get_tree_for_commit(allocator, objs_dir, head);
     defer if (head_tree) |t| allocator.free(t);
 
@@ -874,7 +883,7 @@ fn list_commits(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var objs_dir = try vec_dir.openDir("objects", .{});
     defer objs_dir.close();
 
-    const head = try get_head(allocator, vec_dir);
+    const head = try get_head(vec_dir);
     if (head) |h| {
         var msg = try get_commit_message(allocator, objs_dir, h);
         debug.print("commit {s} (HEAD)\n", .{h});
@@ -961,10 +970,12 @@ fn add_file_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !v
     var objs_dir = try vec_dir.openDir("objects", .{});
     defer objs_dir.close();
 
-    const index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
+    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
     var indexed_objs = try get_indexed_objs(allocator, index_file);
     defer allocator.free(indexed_objs);
     defer for (indexed_objs) |*o| o.deinit(); 
+    index_file.close();
+
 
     var file_obj = try get_obj_from_path(allocator, cwd, path);
 
@@ -985,6 +996,9 @@ fn add_file_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !v
         }
         indexed_objs[idx] = file_obj;
     }
+
+    index_file = try vec_dir.createFile("INDEX", .{});
+    defer index_file.close();
 
     try write_indexed_objs(index_file, indexed_objs);
     try store_blob_obj(cwd, objs_dir, file_obj);
@@ -1028,6 +1042,91 @@ fn restore_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
         if (!mem.eql(u8, &indexed_objs[idx].hash, &file_obj.hash)) 
                 try fs.Dir.copyFile(objs_dir, &indexed_objs[idx].hash, cwd, full_path[root_path.len+1..], .{});
     }
+}
+
+fn restore_index_for_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+    const root_path = try root_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    const full_path = try cwd.realpathAlloc(allocator, path);
+    defer allocator.free(full_path);
+
+    if (full_path.len < root_path.len or !mem.eql(u8, root_path, full_path[0..root_path.len])) {
+        debug.print("fatal: provided path '{s}' is outside working directory '{s}'\n", .{full_path, root_path});
+        process.exit(1);
+    }
+
+    const s = try cwd.statFile(path);
+    if (s.kind != .file) {
+        debug.print("fatal: provided path '{s}' is not a file\n", .{full_path});
+        process.exit(1);
+    }
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
+
+    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
+    var indexed_objs = try get_indexed_objs(allocator, index_file);
+    defer allocator.free(indexed_objs);
+    defer for (indexed_objs) |*o| o.deinit(); 
+    index_file.close();
+
+    const indexed_objs_idx = sort.binarySearch(Object, indexed_objs, full_path[root_path.len+1..], Object.compare_obj_to_name);
+    if (indexed_objs_idx) |_| {} else { return; }
+
+    index_file = try vec_dir.createFile("INDEX", .{});
+    defer index_file.close();
+    
+    const tree_hash = try get_tree_for_commit(allocator, objs_dir, try get_head(vec_dir));
+    defer if (tree_hash) |t| allocator.free(t);
+
+    var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree_hash);
+    defer if (commit_tree) |*t| t.deinit();
+
+    if (commit_tree) |*tree| {
+
+        var it = mem.splitScalar(u8, full_path[root_path.len+1..], '/');
+        var tree_it: *Object = @constCast(tree);
+        var present = true;
+        while (it.next()) |p| {
+            if (it.peek()) |_| {
+                const p1 = try fmt.allocPrint(allocator, "{s}/", .{p});
+                defer allocator.free(p1);
+                if (sort.binarySearch(Object, tree_it.children, p1, Object.compare_obj_to_name)) |idx| {
+                    tree_it = &tree_it.children[idx];
+                } else {
+                    present = false;
+                    break;
+                }
+            } else {
+                if (sort.binarySearch(Object, tree_it.children, p, Object.compare_obj_to_name)) |idx| {
+                    tree_it = &tree_it.children[idx];
+                } else {
+                    present = false;
+                }
+                break;
+            }
+        }
+
+
+        if (present) {
+            _ = try fmt.bufPrint(&indexed_objs[indexed_objs_idx.?].hash, "{s}", .{tree_it.hash});
+            try write_indexed_objs(index_file, indexed_objs);
+            return;
+        }
+    } 
+
+    indexed_objs[indexed_objs_idx.?].deinit();
+    for (indexed_objs_idx.?..indexed_objs.len-1) |i| {
+        indexed_objs[i] = indexed_objs[i+1];
+    }
+    indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len - 1);
+
+    try write_indexed_objs(index_file, indexed_objs);
 }
 
 fn compare_commits(allocator: mem.Allocator, cwd: fs.Dir, commit1: []const u8, commit2: []const u8) !void {
