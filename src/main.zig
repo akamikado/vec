@@ -38,19 +38,16 @@ pub fn main() !void {
             }
             try check_status(allocator, cwd);
         } else if (mem.eql(u8, arg, "diff")) {
-            const arg2 = args.next();
-            const arg3 = args.next();
-            if (arg2) |a2| {
-                if (arg3) |a3| {
-                    try compare_commits(allocator, cwd, a2, a3);
+            if (args.next()) |arg2| {
+                if (args.next()) |arg3| {
+                    try compare_commits(allocator, cwd, arg2, arg3);
                 } else {
-                    if (mem.eql(u8, a2, "-h") or mem.eql(u8, a2, "--help")) {
+                    if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
                         debug.print("usage: vec diff <file>\n", .{});
                         debug.print("       vec diff <commit> <commit>\n", .{});
                         return;
                     }
-                    // TODO: allow for comparison of directories
-                    try compare_file_with_indexed_obj(allocator, cwd, a2);
+                    _ = try compare_path_with_index(allocator, cwd, arg2);
                 }
             } else {
                 debug.print("fatal: missing file path argument\n", .{});
@@ -1183,7 +1180,7 @@ fn compare_commits(allocator: mem.Allocator, cwd: fs.Dir, commit1: []const u8, c
     }
 }
 
-fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_path: []const u8) !void {
+fn compare_path_with_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !bool {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
@@ -1194,18 +1191,49 @@ fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_pat
     var objs_dir = try vec_dir.openDir("objects", .{});
     defer objs_dir.close();
 
-    const full_path = try cwd.realpathAlloc(allocator, file_path);
+    const full_path = try cwd.realpathAlloc(allocator, path);
     defer allocator.free(full_path);
     if (full_path.len < root_path.len or !mem.eql(u8, root_path, full_path[0..root_path.len])) {
         debug.print("fatal: provided path '{s}' is outside working directory '{s}'\n", .{full_path, root_path});
         process.exit(1);
     }
 
-    const s = try cwd.statFile(file_path);
-    if (s.kind != .file) {
-        debug.print("fatal: provided path '{s}' is not a file\n", .{full_path});
-        process.exit(1);
+    const s = try cwd.statFile(full_path[root_path.len+1..]);
+    if (s.kind == .file) {
+        const changed = try compare_file_with_indexed_obj(allocator, cwd, full_path[root_path.len+1..]);
+        return changed;
+    } else if (s.kind != .directory) return false;
+
+    var changed = false;
+
+    var dir = try cwd.openDir(full_path[root_path.len+1..], .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    var entry = try it.next();
+    while (entry) |e| {
+        const child_full_path = try dir.realpathAlloc(allocator, e.name);
+        defer allocator.free(child_full_path); 
+        if (e.kind == .directory) 
+            changed = try compare_path_with_index(allocator,  cwd, child_full_path[root_path.len+1..]) or changed
+        else if (e.kind == .file) 
+            changed = try compare_file_with_indexed_obj(allocator, cwd, child_full_path[root_path.len+1..]) or changed;
+        
+        entry = try it.next();
     }
+
+    return changed;
+}
+
+fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_path: []const u8) !bool {
+    var root_dir = try get_root_dir(cwd);
+    const root_path = try root_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
 
     const index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
     const indexed_objs = try get_indexed_objs(allocator, index_file);
@@ -1215,7 +1243,7 @@ fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_pat
     var index: usize = 0;
     if (sort.binarySearch(Object, indexed_objs, file_path, Object.compare_obj_to_name)) |i| {
         index = i;
-    } else return;
+    } else return false;
 
     var committed_file = try objs_dir.openFile(&indexed_objs[index].hash, .{ .mode = .read_only });
     defer committed_file.close();
@@ -1232,7 +1260,12 @@ fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_pat
     var stdout_writer = fs.File.stdout().writer(&stdout_buf);
     const stdout = &stdout_writer.interface;
 
-    _ = try myers_diff(@constCast(stdout), allocator, &file_readers);
+    try stdout.print("\n{s}index {s}\n{s}{s}\n", .{sub_prefix, indexed_objs[index].hash, add_prefix, file_path});
+
+    const changed = try myers_diff(@constCast(stdout), allocator, &file_readers);
+    if (changed) try stdout.flush()
+    else try stdout.noopFlush();
+    return changed;
 }
 
 const EditGraph = struct {
@@ -1309,6 +1342,12 @@ fn myers_diff(stdout: *std.Io.Writer, allocator: mem.Allocator, file_readers: *[
     defer edit_graph.deinit(allocator);
 
     var trace = try std.ArrayList(EditGraph).initCapacity(allocator, 16);
+    defer {
+        for (trace.items) |*item| {
+            item.deinit(allocator);
+        }
+        trace.deinit(allocator);
+    }
 
     var d: i64 = 0;
     outer: while (d <= max) {
@@ -1346,8 +1385,8 @@ fn myers_diff(stdout: *std.Io.Writer, allocator: mem.Allocator, file_readers: *[
     var edited_x = try std.ArrayList(i64).initCapacity(allocator, 16);
     defer edited_x.deinit(allocator);
 
-    var edited_k = try std.ArrayList(i64).initCapacity(allocator, 16);
-    defer edited_k.deinit(allocator);
+    var edited_y = try std.ArrayList(i64).initCapacity(allocator, 16);
+    defer edited_y.deinit(allocator);
 
     var x: i64 = @intCast(m);
     var y: i64 = @intCast(n);
@@ -1374,17 +1413,21 @@ fn myers_diff(stdout: *std.Io.Writer, allocator: mem.Allocator, file_readers: *[
             y -= 1;
         }
 
-        if (x == 0 or y == 0) break;
-
-        try edited_x.append(allocator, x);
-        try edited_k.append(allocator, k);
         if (op == .ADD) {
+            if (y == 0) break;
             try edit_ops.append(allocator, .ADD);
+            try edited_x.append(allocator, x);
+            try edited_y.append(allocator, y - 1);
             y -= 1;
         } else {
+            if (x == 0) break;
             try edit_ops.append(allocator, .SUB);
+            try edited_x.append(allocator, x - 1);
+            try edited_y.append(allocator, y);
             x -= 1;
         }
+
+        if (x == 0 and y == 0) break;
 
         d -= 1;
     }
@@ -1393,39 +1436,34 @@ fn myers_diff(stdout: *std.Io.Writer, allocator: mem.Allocator, file_readers: *[
 
     mem.reverse(Operation, edit_ops.items);
     mem.reverse(i64, edited_x.items);
-    mem.reverse(i64, edited_k.items);
+    mem.reverse(i64, edited_y.items);
     var i: usize = 0;
     while (i < edit_ops.items.len) {
-        const x_ = edited_x.items[i];
-        const k_ = edited_k.items[i];
-        const y_ = x_ - k_;
-        // TODO: print lines which are beside each other together
-        if (edit_ops.items[i] == .ADD) {
-            try stdout.print("{d}a{d}\n", .{x_, y_});
-            try stdout.print("{s}{s}\n\n", .{add_prefix, file_contents[1].items[@as(usize, @intCast(y_))-1]});
+        const x1 = edited_x.items[i];
+        const y1 = edited_y.items[i];
+
+        if (edit_ops.items[i] == .SUB and
+            i + 1 < edit_ops.items.len and
+            edit_ops.items[i+1] == .ADD) {
+            const next_y = edited_y.items[i+1];
+            try stdout.print("{d}c{d}\n", .{x1 + 1, next_y + 1});
+            try stdout.print("{s}{s}\n", .{sub_prefix, file_contents[0].items[@as(usize, @intCast(x1))]});
+            try stdout.print("---\n", .{});
+            try stdout.print("{s}{s}\n", .{add_prefix, file_contents[1].items[@as(usize, @intCast(next_y))]});
+            i += 2;
+        } else if (edit_ops.items[i] == .ADD) {
+            try stdout.print("{d}a{d}\n", .{x1, y1 + 1});
+            try stdout.print("{s}{s}\n", .{add_prefix, file_contents[1].items[@as(usize, @intCast(y1))]});
+            i += 1;
         } else {
-            if (i + 1 < edit_ops.items.len and edit_ops.items[i+1] == .ADD and edited_x.items[i+1] == x_ and edited_k.items[i+1] == k_-1) {
-                try stdout.print("{d}c{d}\n", .{x_, edited_x.items[i+1]-edited_k.items[i+1]});
-                try stdout.print("{s}{s}\n", .{sub_prefix, file_contents[0].items[@as(usize, @intCast(x_))-1]});
-                try stdout.print("---\n", .{});
-                try stdout.print("{s}{s}\n\n", .{add_prefix, file_contents[1].items[@as(usize, @intCast(y_))-1]});
-                i += 1;
-            } else {
-                try stdout.print("{d}d{d}\n", .{x_, y_});
-                try stdout.print("{s}{s}\n\n", .{sub_prefix, file_contents[0].items[@as(usize, @intCast(x_))-1]});
-            }
+            try stdout.print("{d}d{d}\n", .{x1 + 1, y1});
+            try stdout.print("{s}{s}\n", .{sub_prefix, file_contents[0].items[@as(usize, @intCast(x1))]});
+            i += 1;
         }
-        try stdout.flush();
-        i += 1;
     }
 
     try file_readers[0].seekTo(0);
     try file_readers[1].seekTo(0);
-
-    for (trace.items) |*v| {
-        v.deinit(allocator);
-    }
-    trace.deinit(allocator);
 
     return true;
 }
