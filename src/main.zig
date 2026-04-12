@@ -47,7 +47,7 @@ pub fn main() !void {
                         debug.print("       vec diff <commit> <commit>\n", .{});
                         return;
                     }
-                    _ = try compare_path_with_index(allocator, cwd, arg2);
+                    _ = try compare_path_with_index(allocator, cwd, arg2, false);
                 }
             } else {
                 debug.print("fatal: missing file path argument\n", .{});
@@ -72,6 +72,7 @@ pub fn main() !void {
             if (args.next()) |arg2| {
                 if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
                     debug.print("usage: vec restore <file>\n", .{});
+                    debug.print("       vec restore --staged <file>\n", .{});
                     return;
                 } else if (mem.eql(u8, arg2, "--staged")) {
                     if (args.next()) |arg3| {
@@ -112,17 +113,42 @@ pub fn main() !void {
                 return;
             }
             try list_commits(allocator, cwd);
+        } else if (mem.eql(u8, arg, "reset")) {
+            if (args.next()) |arg2| {
+                if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
+                    debug.print("usage: vec reset <commit hash>\n", .{});
+                    debug.print("       vec reset --soft <commit hash>\n", .{});
+                    debug.print("       vec reset --mixed <commit hash>\n", .{});
+                    return;
+                } else if (mem.eql(u8, arg2, "--soft")) {
+                    if (args.next()) |arg3| {
+                        try reset_soft(cwd, arg3);
+                    } else {
+                        debug.print("fatal: missing commit hash argument\n", .{});
+                        debug.print("usage: vec reset --soft <commit hash>\n", .{});
+                        return;
+                    }
+                } else {
+                    try reset_mixed(allocator, cwd, arg2);
+                }
+            } else {
+                debug.print("fatal: missing commit hash argument\n", .{});
+                debug.print("usage: vec reset <commit hash>\n", .{});
+                return;
+            }
         } else if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help") or mem.eql(u8, arg, "help")) {
             const help_str = 
                 \\usage: vec <command> [<args>]
                 \\
                 \\Available commands:
-                \\  init:   Create a working area
-                \\  status: Show the working tree status
-                \\  diff:   Show changes between working tree and commit
-                \\  add:    Add file contents to index
-                \\  commit: Record changes to the working area
-                \\  log:    Show commit logs
+                \\  init:    Create a working area
+                \\  status:  Show the working tree status
+                \\  diff:    Show changes between working tree and commit
+                \\  add:     Add file contents to index
+                \\  restore: Restore working tree files
+                \\  commit:  Record changes to the working area
+                \\  log:     Show commit logs
+                \\  reset:   Reset current HEAD to specified state
             ;
             debug.print("{s}\n", .{help_str});
         } else {
@@ -898,6 +924,138 @@ fn list_commits(allocator: mem.Allocator, cwd: fs.Dir) !void {
     }
 }
 
+fn reset_soft(cwd: fs.Dir, commit: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
+
+    var target_commit: [40]u8 = undefined;
+    _ = try fmt.bufPrint(&target_commit, "{s}", .{commit});
+
+    const head = try get_head(vec_dir);
+    if (head) |h| {
+        var it = try get_parent_commit(objs_dir, h);
+        while (it) |c| {
+            if (mem.eql(u8, &c, &target_commit)) {
+                try set_head(vec_dir, target_commit);
+                return;
+            }
+            it = try get_parent_commit(objs_dir, c);
+        } else {}
+    }
+
+    debug.print("fatal: provided commit does not exist\n", .{});
+}
+
+fn reset_mixed(allocator: mem.Allocator, cwd: fs.Dir, commit: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
+
+    const head = try get_head(vec_dir);
+    const tree = try get_tree_for_commit(allocator, objs_dir, head);
+    defer if (tree) |t| allocator.free(t);
+
+    var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
+    defer if (commit_tree) |*t| t.deinit();
+
+    var current_tree = try construct_tree_from_dir(allocator, null, "", root_dir);
+    defer current_tree.deinit();
+
+    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
+
+    var index_tree = try construct_tree_from_index(allocator, index_file);
+    defer if (index_tree) |*t| t.deinit();
+
+    var staged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer staged_changes.deinit(allocator);
+
+    var unstaged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer unstaged_changes.deinit(allocator);
+
+    if (index_tree) |t| try compare_index_tree_with_commit_tree(allocator, t, commit_tree, &staged_changes);
+    try compare_index_tree_with_current_tree(allocator, index_tree, current_tree, &unstaged_changes);
+
+    if (staged_changes.items.len > 0) {
+        debug.print("fatal: staged changes have not been committed\n", .{});
+        return;
+    }
+
+    for (0..unstaged_changes.items.len) |i| {
+        if (unstaged_changes.items[i].status == .deleted or unstaged_changes.items[i].status == .modified) {
+            debug.print("fatal: files have been modified in working directory\n", .{});
+            return;
+        }
+    }
+
+    var target_commit: [40]u8 = undefined;
+    _ = try fmt.bufPrint(&target_commit, "{s}", .{commit});
+
+    var is_present = false;
+    if (head) |h| {
+        var it = try get_parent_commit(objs_dir, h);
+        while (it) |c| {
+            if (mem.eql(u8, &c, &target_commit)) {
+                is_present = true;
+                break;
+            }
+            it = try get_parent_commit(objs_dir, c);
+        } else {}
+    }
+
+    if (!is_present) {
+        debug.print("fatal: provided commit does not exist\n", .{});
+        return;
+    }
+
+    const target_tree_hash = try get_tree_for_commit(allocator, objs_dir, target_commit);
+    defer if (target_tree_hash) |t| allocator.free(t);
+    var target_tree = try construct_tree_from_hash(allocator, objs_dir, target_tree_hash);
+    defer if (target_tree) |*t| t.deinit();
+
+    var indexed_objs = try flatten_tree_obj(allocator, target_tree.?, "");
+    defer allocator.free(indexed_objs);
+    defer for (0..indexed_objs.len) |i| indexed_objs[i].deinit();
+
+    index_file.close();
+    var new_index_file = try vec_dir.createFile("INDEX", .{});
+    defer new_index_file.close();
+    try write_indexed_objs(new_index_file, indexed_objs);
+    try set_head(vec_dir, target_commit);
+}
+
+fn flatten_tree_obj(allocator: mem.Allocator, tree: Object, parent_dir: []const u8) ![]Object {
+    var objs = try std.ArrayList(Object).initCapacity(allocator, 16);
+    defer objs.deinit(allocator);
+
+    for (0..tree.children.len) |i| {
+        if (tree.children[i].kind == .tree) {
+            const children = try flatten_tree_obj(allocator, tree.children[i], tree.children[i].name);
+            defer allocator.free(children);
+            try objs.appendSlice(allocator, children);
+        } else {
+            var o = Object {
+                .name = &[0]u8{},
+                .kind = .blob,
+                .allocator = allocator
+            };
+            _ = try fmt.bufPrint(&o.hash, "{s}", .{tree.children[i].hash});
+            o.name = try fmt.allocPrint(allocator, "{s}{s}", .{parent_dir, tree.children[i].name});
+            try objs.append(allocator, o);
+        }
+    }
+
+    return objs.toOwnedSlice(allocator);
+}
+
 fn get_indexed_objs(allocator: mem.Allocator, index_file: fs.File) ![]Object {
     var file_buf: [1024]u8 = undefined;
     var r = index_file.reader(&file_buf);
@@ -943,6 +1101,7 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
         return;
     } else if (s.kind != .directory) return;
 
+    // BUG: won't work if path given is root dir
     var dir = try cwd.openDir(full_path[root_path.len+1..], .{ .iterate = true });
     defer dir.close();
     var it = dir.iterate();
@@ -1180,7 +1339,7 @@ fn compare_commits(allocator: mem.Allocator, cwd: fs.Dir, commit1: []const u8, c
     }
 }
 
-fn compare_path_with_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !bool {
+fn compare_path_with_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8, no_output: bool) !bool {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
@@ -1200,12 +1359,13 @@ fn compare_path_with_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const 
 
     const s = try cwd.statFile(full_path[root_path.len+1..]);
     if (s.kind == .file) {
-        const changed = try compare_file_with_indexed_obj(allocator, cwd, full_path[root_path.len+1..]);
+        const changed = try compare_file_with_indexed_obj(allocator, cwd, full_path[root_path.len+1..], no_output);
         return changed;
     } else if (s.kind != .directory) return false;
 
     var changed = false;
 
+    // BUG: won't work if path given is root dir
     var dir = try cwd.openDir(full_path[root_path.len+1..], .{ .iterate = true });
     defer dir.close();
     var it = dir.iterate();
@@ -1214,9 +1374,9 @@ fn compare_path_with_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const 
         const child_full_path = try dir.realpathAlloc(allocator, e.name);
         defer allocator.free(child_full_path); 
         if (e.kind == .directory) 
-            changed = try compare_path_with_index(allocator,  cwd, child_full_path[root_path.len+1..]) or changed
+            changed = try compare_path_with_index(allocator,  cwd, child_full_path[root_path.len+1..], no_output) or changed
         else if (e.kind == .file) 
-            changed = try compare_file_with_indexed_obj(allocator, cwd, child_full_path[root_path.len+1..]) or changed;
+            changed = try compare_file_with_indexed_obj(allocator, cwd, child_full_path[root_path.len+1..], no_output) or changed;
         
         entry = try it.next();
     }
@@ -1224,7 +1384,7 @@ fn compare_path_with_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const 
     return changed;
 }
 
-fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_path: []const u8) !bool {
+fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_path: []const u8, no_output: bool) !bool {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
@@ -1263,8 +1423,8 @@ fn compare_file_with_indexed_obj(allocator: mem.Allocator, cwd: fs.Dir, file_pat
     try stdout.print("\n{s}index {s}\n{s}{s}\n", .{sub_prefix, indexed_objs[index].hash, add_prefix, file_path});
 
     const changed = try myers_diff(@constCast(stdout), allocator, &file_readers);
-    if (changed) try stdout.flush()
-    else try stdout.noopFlush();
+    if (!changed or no_output) try stdout.noopFlush()
+    else try stdout.flush();
     return changed;
 }
 

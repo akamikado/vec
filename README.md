@@ -12,15 +12,16 @@ A simple version control system written in [zig](https://ziglang.org/), built to
 - Commit: Creates snapshots of staged files and stores them as versioned objects
 - Log: Displays the history of commits in the repository
 - Restore: Restore file to previous snapshot version
+- Reset: Reset state of working to previous commit
 
 ## Planned Features
 - [x] Staging area
     - [x] Stage files
     - [x] Unstage files
 - [x] Diff Support: Show difference between current state of file and state of the file in previous commit
-- [ ] Commit History
+- [x] Commit History
     - [x] View commit history
-    - [ ] Restore working directory to a previous commit snapshot
+    - [x] Restore working directory to a previous commit snapshot
 - [ ] Branching
 - [ ] Object Compression: Reduce storage size of stored objects
 
