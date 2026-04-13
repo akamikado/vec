@@ -71,26 +71,24 @@ pub fn main() !void {
         } else if (mem.eql(u8, arg, "restore")) {
             if (args.next()) |arg2| {
                 if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
-                    debug.print("usage: vec restore <file>\n", .{});
-                    debug.print("       vec restore --staged <file>\n", .{});
+                    debug.print("usage: vec restore <path>\n", .{});
+                    debug.print("       vec restore --staged <path>\n", .{});
                     return;
                 } else if (mem.eql(u8, arg2, "--staged")) {
                     if (args.next()) |arg3| {
-                        // TODO: allow for directories
-                        try restore_index_for_file(allocator, cwd, arg3);
+                        try restore_index_for_path(allocator, cwd, arg3);
                     } else {
-                        debug.print("fatal: missing file path argument\n", .{});
-                        debug.print("usage: vec restore --staged <file>\n", .{});
+                        debug.print("fatal: missing path argument\n", .{});
+                        debug.print("usage: vec restore --staged <path>\n", .{});
                     }
                     return;
                 } else {
-                    // TODO: allow for restore of directories
-                    try restore_file(allocator, cwd, arg2);
+                    try restore_path(allocator, cwd, arg2);
                 }
             } else {
-                debug.print("fatal: missing file path argument\n", .{});
-                debug.print("usage: vec restore <file>\n", .{});
-                debug.print("       vec restore --staged <file>\n", .{});
+                debug.print("fatal: missing path argument\n", .{});
+                debug.print("usage: vec restore <path>\n", .{});
+                debug.print("       vec restore --staged <path>\n", .{});
                 return;
             }
         } else if (mem.eql(u8, arg, "commit")) {
@@ -1248,7 +1246,7 @@ fn restore_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     }
 }
 
-fn restore_index_for_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
+fn restore_index_for_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
@@ -1261,12 +1259,32 @@ fn restore_index_for_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u
         process.exit(1);
     }
 
-    const s = try cwd.statFile(path);
-    if (s.kind != .file) {
-        debug.print("fatal: provided path '{s}' is not a file\n", .{full_path});
-        process.exit(1);
+    const internal_path = if (full_path.len > root_path.len) full_path[root_path.len+1..] else ".";
+
+    const s = try cwd.statFile(internal_path);
+    if (s.kind == .file) {
+        try restore_index_for_file(allocator, root_dir, internal_path);
+    } else if (s.kind != .directory) {
+        return;
     }
 
+    var dir = try root_dir.openDir(internal_path, .{ .iterate = true });
+    defer if (full_path.len > root_path.len) dir.close();
+    var it = dir.iterate();
+    var entry = try it.next();
+    while (entry) |e| {
+        const child_full_path = try dir.realpathAlloc(allocator, e.name);
+        defer allocator.free(child_full_path); 
+        if (e.kind == .directory) 
+            try restore_index_for_path(allocator, root_dir, child_full_path[root_path.len+1..])
+        else if (e.kind == .file) 
+            try restore_index_for_file(allocator, root_dir, child_full_path[root_path.len+1..]);
+        
+        entry = try it.next();
+    }
+}
+
+fn restore_index_for_file(allocator: mem.Allocator, root_dir: fs.Dir, path: []const u8) !void {
     var vec_dir = try root_dir.openDir(".vec", .{});
     defer vec_dir.close();
 
@@ -1279,7 +1297,7 @@ fn restore_index_for_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u
     defer for (indexed_objs) |*o| o.deinit(); 
     index_file.close();
 
-    const indexed_objs_idx = sort.binarySearch(Object, indexed_objs, full_path[root_path.len+1..], Object.compare_obj_to_name);
+    const indexed_objs_idx = sort.binarySearch(Object, indexed_objs, path, Object.compare_obj_to_name);
     if (indexed_objs_idx) |_| {} else { return; }
 
     index_file = try vec_dir.createFile("INDEX", .{});
@@ -1292,8 +1310,7 @@ fn restore_index_for_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u
     defer if (commit_tree) |*t| t.deinit();
 
     if (commit_tree) |*tree| {
-
-        var it = mem.splitScalar(u8, full_path[root_path.len+1..], '/');
+        var it = mem.splitScalar(u8, path, '/');
         var tree_it: *Object = @constCast(tree);
         var present = true;
         while (it.next()) |p| {
