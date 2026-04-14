@@ -197,37 +197,86 @@ fn init_vec_dir(root_dir: fs.Dir) !void {
             else => return err
         }
     };
-    _ = root_dir.createFile(".vec/HEAD", .{}) catch |err| {
+    root_dir.makeDir(".vec/branches/") catch |err| {
         switch (err) {
             error.PathAlreadyExists => {},
             else => return err
         }
     };
-    _ = root_dir.createFile(".vec/INDEX", .{}) catch |err| {
-        switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err
-        }
+    root_dir.access(".vec/HEAD", .{}) catch |err| {
+        if (err == fs.Dir.AccessError.FileNotFound) {
+            var head_file = try root_dir.createFile(".vec/HEAD", .{});
+            defer head_file.close();
+            var head_file_write_buf: [1024]u8 = undefined;
+            var w = head_file.writer(&head_file_write_buf);
+
+            try w.interface.print("ref:main", .{});
+            try w.interface.flush();
+        } else return err;
     };
+    root_dir.access(".vec/INDEX", .{}) catch |err| {
+        if (err == fs.Dir.AccessError.FileNotFound) {
+            _ = try root_dir.createFile(".vec/INDEX", .{});
+        } else return err;
+    };
+    root_dir.access(".vec/branches/main", .{}) catch |err| {
+        if (err == fs.Dir.AccessError.FileNotFound) {
+            _ = try root_dir.createFile(".vec/branches/main", .{});
+        } else return err;
+    };
+
+
 }
 
 fn get_head(vec_dir: fs.Dir) !?[40]u8 {
-    var head_file_buf: [64]u8 = undefined;
+    var head_file_buf: [512]u8 = undefined;
+    const head_file = try vec_dir.openFile("HEAD", .{});
+    var r1 = head_file.reader(&head_file_buf);
+    const line1 = try r1.interface.takeDelimiter('\n');
+    if (line1) |l1| {
+        if (mem.startsWith(u8, l1, "ref:")) {
+            var branches_dir = try vec_dir.openDir("branches", .{});
+            defer branches_dir.close();
+
+            var branch_file = try branches_dir.openFile(l1[4..], .{ .mode =  .read_only });
+            defer branch_file.close();
+            var branch_file_buf: [64]u8 = undefined;
+            var r2 = branch_file.reader(&branch_file_buf);
+            const line2 = try r2.interface.takeDelimiter('\n');
+            if (line2) |l2| {
+                var buf: [40]u8 = undefined;
+                var w = std.Io.Writer.fixed(&buf);
+                try w.print("{s}", .{l2});
+                try w.flush();
+                return buf;
+            }
+        }
+        var buf: [40]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try w.print("{s}", .{l1});
+        try w.flush();
+        return buf;
+    }
+    return null;
+}
+
+fn get_branch(allocator: mem.Allocator, vec_dir: fs.Dir) !?[]const u8 {
+    var head_file_buf: [512]u8 = undefined;
     const head_file = try vec_dir.openFile("HEAD", .{});
     var r = head_file.reader(&head_file_buf);
-    var reader = &r.interface;
-    const head = reader.peekArray(40) catch |err| {
-        switch (err) {
-            error.EndOfStream => { return null; },
-            else => return err,
+    const line = try r.interface.takeDelimiter('\n');
+
+    if (line) |l| {
+        if (mem.startsWith(u8, l, "ref:")) {
+            const branch = try fmt.allocPrint(allocator, "{s}", .{l[4..]});
+            return branch;
+        } else {
+            return null;
         }
-    };
-    var buf: [40]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    reader.toss(40);
-    try w.print("{s}", .{head});
-    try w.flush();
-    return buf;
+    } else {
+        debug.print("fatal: HEAD has been corrupted\n", .{});
+        return error.CorruptedHead;
+    }
 }
 
 fn get_parent_commit(objs_dir: fs.Dir, commit: [40]u8) !?[40]u8 {
@@ -367,9 +416,18 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var objs_dir = try vec_dir.openDir("objects", .{});
     defer objs_dir.close();
 
+    const branch = try get_branch(allocator, vec_dir);
+    defer if (branch) |b| allocator.free(b);
+
+    if (branch) |_| {} else {
+        debug.print("Head is currently detached. Cannot check status\n", .{});
+        return;
+    }
+
     const head = try get_head(vec_dir);
     const tree = try get_tree_for_commit(allocator, objs_dir, head);
     defer if (tree) |t| allocator.free(t);
+
 
     var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
     defer if (commit_tree) |*t| t.deinit();
@@ -410,6 +468,8 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
             else       => {}
         }
     }
+
+    debug.print("On branch {s}\n\n", .{branch.?});
 
     if (staged_changes.items.len > 0) debug.print("Staged changes:\n", .{});
     for (staged_modified_objs.items) |i| {
@@ -792,16 +852,26 @@ fn snapshot_tree(allocator: mem.Allocator, cwd:fs.Dir, tree: Object, msg: []cons
     var objs_dir = try vec_dir.openDir("objects", .{});
     defer objs_dir.close();
 
+    const branch = try get_branch(allocator, vec_dir);
+    defer if (branch) |b| allocator.free(b);
+
+    if (branch) |_| {} else {
+        debug.print("Head is currently detached. Cannot create commits\n", .{});
+        return;
+    }
+
     const head = try get_head(vec_dir);
     const head_tree = try get_tree_for_commit(allocator, objs_dir, head);
     defer if (head_tree) |t| allocator.free(t);
 
-    if (head_tree) |ht| 
+    if (head_tree) |ht| {
         if (mem.eql(u8, ht, &tree.hash)) {
             try check_status(allocator, cwd);
             debug.print("no changes to commit\n", .{});
             return;
-        };
+        }
+    }
+
     try store_tree_obj(root_dir, objs_dir, tree);
     const new_commit = try write_commit_obj(objs_dir, head, tree.hash, msg);
     try set_head(vec_dir, new_commit);
@@ -896,12 +966,24 @@ fn set_head(vec_dir: fs.Dir, new_head: [40]u8) !void {
     var head_file = try vec_dir.openFile("HEAD", .{ .mode = .read_write });
     defer head_file.close();
 
-    var buf: [1024]u8 = undefined;
-    var w = head_file.writer(&buf);
-    var writer = &w.interface;
+    var head_file_read_buf: [512]u8 = undefined;
+    var r = head_file.reader(&head_file_read_buf);
+    const line = try r.interface.takeDelimiter('\n');
 
-    try writer.print("{s}", .{new_head});
-    try writer.flush();
+    var branch_file: fs.File = undefined;
+    defer branch_file.close();
+    var branches_dir = try vec_dir.openDir("branches", .{});
+    defer branches_dir.close();
+    if (line) |l| {
+        if (mem.startsWith(u8, l, "ref:")) 
+            branch_file = try branches_dir.openFile(l[4..], .{ .mode =  .read_only });
+    }
+    var branch_write_buf: [64]u8 = undefined;
+    var w = branch_file.writer(&branch_write_buf);
+
+    try w.interface.print("{s}", .{new_head});
+    try w.interface.flush();
+
 }
 
 fn list_commits(allocator: mem.Allocator, cwd: fs.Dir) !void {
