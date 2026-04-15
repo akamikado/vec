@@ -37,6 +37,47 @@ pub fn main() !void {
                 return;
             }
             try check_status(allocator, cwd);
+        } else if (mem.eql(u8, arg, "branch")) {
+            if (args.next()) |cmd| {
+                if (!mem.eql(u8, cmd, "-h") and !mem.eql(u8, cmd, "--help")) 
+                    debug.print("fatal: unknown command {s}\n", .{cmd});
+                debug.print("usage: vec branch\n", .{});
+                return;
+            }
+            try list_branches(allocator, cwd);
+        } else if (mem.eql(u8, arg, "checkout")) {
+            if (args.next()) |arg2| {
+                if (mem.eql(u8, arg2, "-h") and !mem.eql(u8, arg2, "--help")) {
+                    debug.print("usage: vec checkout <branch>\n", .{});
+                    debug.print("       vec checkout --new <branch>\n", .{});
+                    debug.print("       vec checkout --commit <commit>\n", .{});
+                    return;
+                } else if (mem.eql(u8, arg2, "--new") or mem.eql(u8, arg2, "-n")) {
+                    if (args.next()) |arg3| {
+                        try switch_branch(allocator, cwd, arg3, true);
+                    } else {
+                        debug.print("fatal: missing branch name argument\n", .{});
+                        debug.print("usage: vec checkout --new <branch>\n", .{});
+                        return;
+                    }
+                } else if (mem.eql(u8, arg2, "--commit") or mem.eql(u8, arg2, "-c")) {
+                    if (args.next()) |arg3| {
+                        try checkout_to_commit(allocator, cwd, arg3);
+                    } else {
+                        debug.print("fatal: missing branch name argument\n", .{});
+                        debug.print("usage: vec checkout --hash <commit>\n", .{});
+                        return;
+                    }
+                } else {
+                    try switch_branch(allocator, cwd, arg2, false);
+                }
+            } else {
+                debug.print("fatal: missing branch name argument\n", .{});
+                debug.print("usage: vec checkout <branch>\n", .{});
+                debug.print("       vec checkout --new <branch>\n", .{});
+                debug.print("       vec checkout --hash <commit>\n", .{});
+                return;
+            }
         } else if (mem.eql(u8, arg, "diff")) {
             if (args.next()) |arg2| {
                 if (args.next()) |arg3| {
@@ -114,10 +155,10 @@ pub fn main() !void {
         } else if (mem.eql(u8, arg, "reset")) {
             if (args.next()) |arg2| {
                 if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
-                    debug.print("usage: vec reset <commit hash>\n", .{});
-                    debug.print("       vec reset --soft <commit hash>\n", .{});
-                    debug.print("       vec reset --mixed <commit hash>\n", .{});
-                    debug.print("       vec reset --hard <commit hash>\n", .{});
+                    debug.print("usage: vec reset <commit>\n", .{});
+                    debug.print("       vec reset --soft <commit>\n", .{});
+                    debug.print("       vec reset --mixed <commit>\n", .{});
+                    debug.print("       vec reset --hard <commit>\n", .{});
                     return;
                 } else if (mem.eql(u8, arg2, "--soft")) {
                     if (args.next()) |arg3| {
@@ -150,6 +191,7 @@ pub fn main() !void {
                 \\Available commands:
                 \\  init:    Create a working area
                 \\  status:  Show the working tree status
+                \\  branch:  List all branches
                 \\  diff:    Show changes between working tree and commit
                 \\  add:     Add file contents to index
                 \\  restore: Restore working tree files
@@ -249,6 +291,8 @@ fn get_head(vec_dir: fs.Dir) !?[40]u8 {
                 try w.print("{s}", .{l2});
                 try w.flush();
                 return buf;
+            } else {
+                return null;
             }
         }
         var buf: [40]u8 = undefined;
@@ -256,8 +300,10 @@ fn get_head(vec_dir: fs.Dir) !?[40]u8 {
         try w.print("{s}", .{l1});
         try w.flush();
         return buf;
+    } else {
+        debug.print("fatal: HEAD has been corrupted\n", .{});
+        return error.CorruptedHead;
     }
-    return null;
 }
 
 fn get_branch(allocator: mem.Allocator, vec_dir: fs.Dir) !?[]const u8 {
@@ -277,6 +323,13 @@ fn get_branch(allocator: mem.Allocator, vec_dir: fs.Dir) !?[]const u8 {
         debug.print("fatal: HEAD has been corrupted\n", .{});
         return error.CorruptedHead;
     }
+}
+
+fn branch_exists(branches_dir: fs.Dir, branch: []const u8) bool {
+    branches_dir.access(branch, .{}) catch {
+        return false;
+    };
+    return true;
 }
 
 fn get_parent_commit(objs_dir: fs.Dir, commit: [40]u8) !?[40]u8 {
@@ -428,7 +481,6 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     const tree = try get_tree_for_commit(allocator, objs_dir, head);
     defer if (tree) |t| allocator.free(t);
 
-
     var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
     defer if (commit_tree) |*t| t.deinit();
 
@@ -515,6 +567,202 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     for (unstaged_deleted_objs.items) |i| {
         debug.print("\tdeleted:\t{s}\n", .{unstaged_changes.items[i].obj1.name});
     }
+}
+
+fn list_branches(allocator: mem.Allocator, cwd: fs.Dir) !void {
+    var root_dir = try get_root_dir(cwd);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    const current_branch = try get_branch(allocator, vec_dir);
+    defer if (current_branch) |b| allocator.free(b);
+
+    if (current_branch) |_| {} else {
+        const head = try get_head(vec_dir);
+        if (head) |h| debug.print("* (HEAD detached at {s})\n", .{h});
+    }
+
+    var branches_dir = try vec_dir.openDir("branches", .{ .iterate = true });
+    defer branches_dir.close();
+
+    var it = branches_dir.iterate();
+    var entry = try it.next();
+    while (entry) |e| {
+        if (current_branch) |b|
+            if (mem.eql(u8, b, e.name))
+                debug.print("* ", .{});
+        debug.print("{s}\n", .{e.name});
+        entry = try it.next();
+    }
+}
+
+fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u8, new_branch: bool) !void {
+    var root_dir = try get_root_dir(cwd);
+
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
+
+    const current_branch = try get_branch(allocator, vec_dir);
+    defer if (current_branch) |b| allocator.free(b);
+
+    if (current_branch) |b| if (mem.eql(u8, b, target_branch)) {
+        debug.print("already on branch {s}\n", .{b});
+        return;
+    };
+
+    var objs_dir = try vec_dir.openDir("objects", .{ .iterate = true });
+    defer objs_dir.close();
+
+    var branches_dir = try vec_dir.openDir("branches", .{ .iterate = true });
+    defer branches_dir.close();
+
+    if (new_branch) {
+        if (branch_exists(branches_dir, target_branch)) {
+            debug.print("fatal: branch {s} already exists\n", .{target_branch});
+        } else {
+            _ = try branches_dir.createFile(target_branch, .{});
+            const head_commit_hash = try get_head(vec_dir);
+            try set_branch(vec_dir, target_branch);
+            if (head_commit_hash) |h| try set_head(vec_dir, h);
+            
+            debug.print("Switched to branch {s}\n", .{target_branch});
+        }
+        return;
+    }
+
+    if (!branch_exists(branches_dir, target_branch)) {
+        debug.print("fatal: branch {s} does not exist\n", .{target_branch});
+        return;
+    }
+
+    const head = try get_head(vec_dir);
+    const tree = try get_tree_for_commit(allocator, objs_dir, head);
+    defer if (tree) |t| allocator.free(t);
+
+    var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
+    defer if (commit_tree) |*t| t.deinit();
+
+    var current_tree = try construct_tree_from_dir(allocator, null, "", root_dir);
+    defer current_tree.deinit();
+
+    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
+
+    var index_tree = try construct_tree_from_index(allocator, index_file);
+    defer if (index_tree) |*t| t.deinit();
+
+    var staged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer staged_changes.deinit(allocator);
+
+    if (index_tree) |t| try compare_index_tree_with_commit_tree(allocator, t, commit_tree, &staged_changes);
+    if (staged_changes.items.len > 0) {
+        debug.print("fatal: your changes will be overwritten by checkout\n", .{});
+        return;
+    }
+
+    var unstaged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer unstaged_changes.deinit(allocator);
+
+    try compare_index_tree_with_current_tree(allocator, index_tree, current_tree, &unstaged_changes);
+    for (0..unstaged_changes.items.len) |i| {
+        if (unstaged_changes.items[i].status == .deleted or unstaged_changes.items[i].status == .modified) {
+            debug.print("fatal: your changes will be overwritten by checkout\n", .{});
+            return;
+        }
+    }
+
+    try set_branch(vec_dir, target_branch);
+    const target_commit_hash = try get_head(vec_dir);
+
+    const target_tree_hash = try get_tree_for_commit(allocator, objs_dir, target_commit_hash);
+    defer if (target_tree_hash) |t| allocator.free(t);
+    var target_tree = try construct_tree_from_hash(allocator, objs_dir, target_tree_hash);
+    defer if (target_tree) |*t| t.deinit();
+
+    var indexed_objs = try flatten_tree_obj(allocator, target_tree.?, "");
+    defer allocator.free(indexed_objs);
+    defer for (0..indexed_objs.len) |i| indexed_objs[i].deinit();
+
+    index_file.close();
+    var new_index_file = try vec_dir.createFile("INDEX", .{});
+    defer new_index_file.close();
+    try write_indexed_objs(new_index_file, indexed_objs);
+
+    try restore_path(allocator, root_dir, ".");
+
+    debug.print("Switched to branch {s}\n", .{target_branch});
+}
+
+fn checkout_to_commit(allocator: mem.Allocator, cwd: fs.Dir, target_commit: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+
+    var vec_dir = try root_dir.openDir(".vec", .{ .iterate = true });
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir("objects", .{ .iterate = true });
+    defer objs_dir.close();
+
+    var target_commit_hash: [40]u8 = undefined;
+    _ = try fmt.bufPrint(&target_commit_hash, "{s}", .{target_commit});
+
+    if (!commit_exists(objs_dir, target_commit_hash)) {
+        debug.print("fatal: commit {s} does not exist\n", .{target_commit});
+        return;
+    }
+
+    const head = try get_head(vec_dir);
+    const tree = try get_tree_for_commit(allocator, objs_dir, head);
+    defer if (tree) |t| allocator.free(t);
+
+    var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
+    defer if (commit_tree) |*t| t.deinit();
+
+    var current_tree = try construct_tree_from_dir(allocator, null, "", root_dir);
+    defer current_tree.deinit();
+
+    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
+
+    var index_tree = try construct_tree_from_index(allocator, index_file);
+    defer if (index_tree) |*t| t.deinit();
+
+    var staged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer staged_changes.deinit(allocator);
+
+    if (index_tree) |t| try compare_index_tree_with_commit_tree(allocator, t, commit_tree, &staged_changes);
+    if (staged_changes.items.len > 0) {
+        debug.print("fatal: your changes will be overwritten by checkout\n", .{});
+        return;
+    }
+
+    var unstaged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer unstaged_changes.deinit(allocator);
+
+    try compare_index_tree_with_current_tree(allocator, index_tree, current_tree, &unstaged_changes);
+    for (0..unstaged_changes.items.len) |i| {
+        if (unstaged_changes.items[i].status == .deleted or unstaged_changes.items[i].status == .modified) {
+            debug.print("fatal: your changes will be overwritten by checkout\n", .{});
+            return;
+        }
+    }
+
+    const target_tree_hash = try get_tree_for_commit(allocator, objs_dir, target_commit_hash);
+    defer if (target_tree_hash) |t| allocator.free(t);
+    var target_tree = try construct_tree_from_hash(allocator, objs_dir, target_tree_hash);
+    defer if (target_tree) |*t| t.deinit();
+
+    var indexed_objs = try flatten_tree_obj(allocator, target_tree.?, "");
+    defer allocator.free(indexed_objs);
+    defer for (0..indexed_objs.len) |i| indexed_objs[i].deinit();
+
+    index_file.close();
+    var new_index_file = try vec_dir.createFile("INDEX", .{});
+    defer new_index_file.close();
+    try write_indexed_objs(new_index_file, indexed_objs);
+
+    try set_detached_head(vec_dir, target_commit_hash);
+    try restore_path(allocator, root_dir, ".");
+
+    debug.print("switched to commit {s} with detached HEAD\n", .{target_commit_hash});
 }
 
 fn construct_tree_from_hash(allocator: mem.Allocator, objs_dir: fs.Dir, hash: ?[]u8) !?Object {
@@ -951,6 +1199,13 @@ fn write_commit_obj(objs_dir: fs.Dir, prev_commit_hash: ?[40]u8, tree_hash: [40]
     return hash;
 }
 
+fn commit_exists(objs_dir: fs.Dir, commit_hash: [40]u8) bool {
+    objs_dir.access(&commit_hash, .{}) catch {
+        return false;
+    };
+    return true;
+}
+
 fn write_indexed_objs(index_file: fs.File, objs: []Object) !void {
     var buf: [2*1024]u8 = undefined;
     var w = index_file.writer(&buf);
@@ -962,28 +1217,53 @@ fn write_indexed_objs(index_file: fs.File, objs: []Object) !void {
     }
 }
 
+fn set_branch(vec_dir: fs.Dir, target_branch: []const u8) !void {
+    var head_file = try vec_dir.openFile("HEAD", .{ .mode = .write_only });
+    defer head_file.close();
+
+    var buf: [512]u8 = undefined;
+    var w = head_file.writer(&buf);
+    try w.interface.print("ref:{s}", .{target_branch});
+    try w.interface.flush();
+}
+
+fn set_detached_head(vec_dir: fs.Dir, new_head: [40]u8) !void {
+    var head_file = try vec_dir.createFile("HEAD", .{});
+    defer head_file.close();
+
+    var head_write_buf: [64]u8 = undefined;
+    var w = head_file.writer(&head_write_buf);
+
+    try w.interface.print("{s}", .{new_head});
+    try w.interface.flush();
+}
+
 fn set_head(vec_dir: fs.Dir, new_head: [40]u8) !void {
     var head_file = try vec_dir.openFile("HEAD", .{ .mode = .read_write });
     defer head_file.close();
 
+    var branches_dir = try vec_dir.openDir("branches", .{});
+    defer branches_dir.close();
+
     var head_file_read_buf: [512]u8 = undefined;
     var r = head_file.reader(&head_file_read_buf);
     const line = try r.interface.takeDelimiter('\n');
-
-    var branch_file: fs.File = undefined;
-    defer branch_file.close();
-    var branches_dir = try vec_dir.openDir("branches", .{});
-    defer branches_dir.close();
     if (line) |l| {
-        if (mem.startsWith(u8, l, "ref:")) 
-            branch_file = try branches_dir.openFile(l[4..], .{ .mode =  .read_only });
+        if (mem.startsWith(u8, l, "ref:")) {
+            var branch_file = try branches_dir.createFile(l[4..], .{});
+            defer branch_file.close();
+            var branch_write_buf: [64]u8 = undefined;
+            var w = branch_file.writer(&branch_write_buf);
+
+            try w.interface.print("{s}", .{new_head});
+            try w.interface.flush();
+        } else {
+            debug.assert(false and "must always set_branch before doing set_head or use set_detached_head instead\n");
+        }
+    } else {
+        debug.print("fatal: HEAD has been corrupted\n", .{});
+        return error.CorruptedHead;
     }
-    var branch_write_buf: [64]u8 = undefined;
-    var w = branch_file.writer(&branch_write_buf);
-
-    try w.interface.print("{s}", .{new_head});
-    try w.interface.flush();
-
 }
 
 fn list_commits(allocator: mem.Allocator, cwd: fs.Dir) !void {
@@ -1025,6 +1305,11 @@ fn reset_soft(cwd: fs.Dir, commit: []const u8) !void {
     var target_commit: [40]u8 = undefined;
     _ = try fmt.bufPrint(&target_commit, "{s}", .{commit});
 
+    if (!commit_exists(objs_dir, target_commit)) {
+        debug.print("fatal: commit {s} does not exist\n", .{commit});
+        return;
+    }
+
     const head = try get_head(vec_dir);
     if (head) |h| {
         var it = try get_parent_commit(objs_dir, h);
@@ -1055,6 +1340,14 @@ fn reset_mixed(allocator: mem.Allocator, cwd: fs.Dir, commit: []const u8) !void 
 
     var objs_dir = try vec_dir.openDir("objects", .{});
     defer objs_dir.close();
+
+    var target_commit: [40]u8 = undefined;
+    _ = try fmt.bufPrint(&target_commit, "{s}", .{commit});
+
+    if (!commit_exists(objs_dir, target_commit)) {
+        debug.print("fatal: commit {s} does not exist\n", .{commit});
+        return;
+    }
 
     const head = try get_head(vec_dir);
     const tree = try get_tree_for_commit(allocator, objs_dir, head);
@@ -1091,9 +1384,6 @@ fn reset_mixed(allocator: mem.Allocator, cwd: fs.Dir, commit: []const u8) !void 
             return;
         }
     }
-
-    var target_commit: [40]u8 = undefined;
-    _ = try fmt.bufPrint(&target_commit, "{s}", .{commit});
 
     var is_present = false;
     if (head) |h| {
@@ -1444,8 +1734,18 @@ fn compare_commits(allocator: mem.Allocator, cwd: fs.Dir, commit1: []const u8, c
     var commit1_hash: [40]u8 = undefined;
     _ = try fmt.bufPrint(&commit1_hash, "{s}", .{commit1});
 
+    if (!commit_exists(objs_dir, commit1_hash)) {
+        debug.print("fatal: commit {s} does not exist\n", .{commit1});
+        return;
+    }
+
     var commit2_hash: [40]u8 = undefined;
     _ = try fmt.bufPrint(&commit2_hash, "{s}", .{commit2});
+
+    if (!commit_exists(objs_dir, commit2_hash)) {
+        debug.print("fatal: commit {s} does not exist\n", .{commit2});
+        return;
+    }
 
     const tree1_hash = try get_tree_for_commit(allocator, objs_dir, commit1_hash);
     defer if (tree1_hash) |h| allocator.free(h);
