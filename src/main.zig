@@ -688,6 +688,8 @@ fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u
     defer new_index_file.close();
     try write_indexed_objs(new_index_file, indexed_objs);
 
+    // BUG: doesn't delete items which weren't indexed
+    // TODO: should not use restore path, instead have to delete all files which are currently indexed and then rebuild whole commit from scratch
     try restore_path(allocator, root_dir, ".");
 
     debug.print("Switched to branch {s}\n", .{target_branch});
@@ -760,6 +762,8 @@ fn checkout_to_commit(allocator: mem.Allocator, cwd: fs.Dir, target_commit: []co
     try write_indexed_objs(new_index_file, indexed_objs);
 
     try set_detached_head(vec_dir, target_commit_hash);
+    // BUG: doesn't delete items which weren't indexed
+    // TODO: should not use restore path, instead have to delete all files which are currently indexed and then rebuild whole commit from scratch
     try restore_path(allocator, root_dir, ".");
 
     debug.print("switched to commit {s} with detached HEAD\n", .{target_commit_hash});
@@ -1960,6 +1964,17 @@ fn myers_diff(stdout: *std.Io.Writer, allocator: mem.Allocator, file_readers: *[
         while (k <= d) {
             var x: i64 = undefined;
             if (k == -d or (k != d and edit_graph.get(k-1) < edit_graph.get(k+1))) {
+                // BUG:
+                // 
+                // /home/akamikado/personal/projects/vec/src/main.zig:1893:21: 0x11c7ccb in get (main.zig)
+                //         debug.assert(idx >= 0 and idx < 2*self.max+1);
+                //                     ^
+                // /home/akamikado/personal/projects/vec/src/main.zig:1964:35: 0x118898a in myers_diff (main.zig)
+                //                 x = edit_graph.get(k + 1);
+                //                                   ^
+                // /home/akamikado/personal/projects/vec/src/main.zig:1870:35: 0x1196f53 in compare_file_with_indexed_obj 
+                // (main.zig)
+                //     const changed = try myers_diff(@constCast(stdout), allocator, &file_readers);
                 x = edit_graph.get(k + 1);
             } else {
                 x = edit_graph.get(k - 1) + 1;
