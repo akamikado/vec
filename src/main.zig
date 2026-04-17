@@ -1472,6 +1472,7 @@ fn get_indexed_objs(allocator: mem.Allocator, index_file: fs.File) ![]Object {
     return objs.toOwnedSlice(allocator);
 }
 
+// BUG: cannot add deleted files to index
 fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
@@ -1560,6 +1561,16 @@ fn add_file_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !v
     try store_blob_obj(root_dir, objs_dir, indexed_objs[indexed_objs_idx]);
 }
 
+// BUG: cannot restore for deleted files
+// TODO: get indexed objects
+//      for all objects 
+//          if path of object contains the path parameter
+//              if file exists in working dir
+//                  get file object and compare hash
+//                  if hash is not same
+//                      copyFile from objects dir
+//              else
+//                  copyFile from objects dir
 fn restore_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
