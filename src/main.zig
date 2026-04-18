@@ -1610,11 +1610,18 @@ fn restore_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
                 var file_obj = try get_file_obj(allocator, null, indexed_objs[i].name, f);
                 defer file_obj.deinit();
                 if (!mem.eql(u8, &indexed_objs[i].hash, &file_obj.hash)) {
+                    if (mem.lastIndexOfScalar(u8, indexed_objs[i].name, '/')) |idx| {
+                        try root_dir.makePath(indexed_objs[i].name[0..idx]);
+                    }
                     try fs.Dir.copyFile(objs_dir, &indexed_objs[i].hash, root_dir, indexed_objs[i].name, .{});
                 }
             } else |err| {
-                if (err == fs.Dir.AccessError.FileNotFound)
-                    try fs.Dir.copyFile(objs_dir, &indexed_objs[i].hash, root_dir, indexed_objs[i].name, .{})
+                if (err == fs.Dir.AccessError.FileNotFound) {
+                    if (mem.lastIndexOfScalar(u8, indexed_objs[i].name, '/')) |idx| {
+                        try root_dir.makePath(indexed_objs[i].name[0..idx]);
+                    }
+                    try fs.Dir.copyFile(objs_dir, &indexed_objs[i].hash, root_dir, indexed_objs[i].name, .{});
+                }
                 else return err;
             }
         }
