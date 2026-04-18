@@ -1472,51 +1472,20 @@ fn get_indexed_objs(allocator: mem.Allocator, index_file: fs.File) ![]Object {
     return objs.toOwnedSlice(allocator);
 }
 
-// BUG: cannot add deleted files to index
 fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
 
-
-    const full_path = try cwd.realpathAlloc(allocator, path);
+    const full_path = try fs.path.resolve(allocator, &.{root_path, path});
     defer allocator.free(full_path);
-    if (full_path.len < root_path.len or !mem.eql(u8, root_path, full_path[0..root_path.len])) {
+    if (full_path.len < root_path.len or !mem.startsWith(u8, full_path, root_path)) {
         debug.print("fatal: provided path '{s}' is outside working directory '{s}'\n", .{full_path, root_path});
         process.exit(1);
     }
 
-    const internal_path = if (full_path.len > root_path.len) full_path[root_path.len+1..] else ".";
-
-    const s = try root_dir.statFile(internal_path);
-    if (s.kind == .file) {
-        try add_file_to_index(allocator, cwd, internal_path);
-        return;
-    } else if (s.kind != .directory) return;
-
-    var dir = try root_dir.openDir(internal_path, .{ .iterate = true });
-    defer if (full_path.len > root_path.len) dir.close();
-    var it = dir.iterate();
-    var entry = try it.next();
-    while (entry) |e| {
-        const child_full_path = try dir.realpathAlloc(allocator, e.name);
-        defer allocator.free(child_full_path); 
-
-        if (e.kind == .directory and mem.eql(u8, e.name, ".vec")) {
-            entry = try it.next();
-            continue;
-        }
-
-        if (e.kind == .directory) 
-            try add_to_index(allocator,  root_dir, child_full_path[root_path.len+1..])
-        else if (e.kind == .file) 
-            try add_file_to_index(allocator, root_dir, child_full_path[root_path.len+1..]);
-        entry = try it.next();
-    }
-}
-
-fn add_file_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
-    var root_dir = try get_root_dir(cwd);
+    const rel_path = if (full_path.len > root_path.len) full_path[root_path.len+1..] else "";
+    if (rel_path.len > 0) try root_dir.access(rel_path, .{});
 
     var vec_dir = try root_dir.openDir(".vec", .{});
     defer vec_dir.close();
@@ -1528,37 +1497,83 @@ fn add_file_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !v
     var indexed_objs = try get_indexed_objs(allocator, index_file);
     defer allocator.free(indexed_objs);
     defer for (indexed_objs) |*o| o.deinit(); 
-    index_file.close();
 
-    var file_obj = try get_obj_from_path(allocator, cwd, path);
-
-    var indexed_objs_idx: usize = undefined;
-
-    if (sort.binarySearch(Object, indexed_objs, file_obj, Object.compare_objs_by_name)) |idx| {
-        file_obj.deinit();
-        if (mem.eql(u8, &indexed_objs[idx].hash, &file_obj.hash)) return;
-
-        _ = try fmt.bufPrint(&indexed_objs[idx].hash, "{s}", .{file_obj.hash});
-        indexed_objs_idx = idx;
-    } else {
-        const idx = sort.upperBound(Object, indexed_objs, file_obj, Object.compare_objs_by_name);
-        indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len + 1);
-        if (idx < indexed_objs.len - 1) {
-            var i = indexed_objs.len - 1;
-            while (i > idx) {
-                indexed_objs[i] = indexed_objs[i-1];
-                i -= 1;
+    var i: usize = 0;
+    while (i < indexed_objs.len) {
+        if (rel_path.len == 0 or mem.startsWith(u8, indexed_objs[i].name, rel_path)) {
+            if (root_dir.access(indexed_objs[i].name, .{})) {
+                var f = try root_dir.openFile(indexed_objs[i].name, .{ .mode = .read_only });
+                defer f.close();
+                var file_obj = try get_file_obj(allocator, null, indexed_objs[i].name, f);
+                defer file_obj.deinit();
+                if (!mem.eql(u8, &indexed_objs[i].hash, &file_obj.hash)) {
+                    _ = try fmt.bufPrint(&indexed_objs[i].hash, "{s}", .{file_obj.hash});
+                }
+                i += 1;
+            } else |err| {
+                if (err == fs.Dir.AccessError.FileNotFound) {
+                    indexed_objs[i].deinit();
+                    for (i..indexed_objs.len-1) |j| {
+                        indexed_objs[j] = indexed_objs[j+1];
+                    }
+                    indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len - 1);
+                }
+                else return err;
             }
+        } else {
+            i += 1;
         }
-        indexed_objs[idx] = file_obj;
-        indexed_objs_idx = idx;
     }
 
+    var d = if (rel_path.len > 0) root_dir.openDir(rel_path, .{.iterate = true}) catch |err| {
+        if (err == fs.Dir.OpenError.NotDir) {
+            index_file.close();
+            index_file = try vec_dir.createFile("INDEX", .{});
+            defer index_file.close();
+
+            try write_indexed_objs(index_file, indexed_objs);
+            return;
+        }
+        return err;
+    } else root_dir;
+    defer if (rel_path.len > 0) d.close();
+
+    var walker = try root_dir.walk(allocator);
+    defer walker.deinit();
+
+    while(walker.next()) |e| {
+        if (e) |entry| {
+            if (mem.startsWith(u8, entry.path, ".vec") or entry.kind == .directory) continue;
+            if (!mem.startsWith(u8, entry.path, rel_path)) continue;
+            if (sort.binarySearch(Object, indexed_objs, entry.path, Object.compare_obj_to_name)) |_| {} else {
+                var f = try root_dir.openFile(entry.path, .{.mode = .read_only});
+                defer f.close();
+                const file_obj = try get_file_obj(allocator, null, entry.path, f);
+
+                const idx = sort.upperBound(Object, indexed_objs, entry.path, Object.compare_obj_to_name);
+                indexed_objs = try allocator.realloc(indexed_objs, indexed_objs.len + 1);
+                if (idx < indexed_objs.len - 1) {
+                    var j = indexed_objs.len - 1;
+                    while (j > idx) {
+                        indexed_objs[j] = indexed_objs[j-1];
+                        j -= 1;
+                    }
+                }
+                indexed_objs[idx] = file_obj;
+                try store_blob_obj(root_dir, objs_dir, indexed_objs[idx]);
+            }
+        } else {
+            break;
+        }
+    } else |err| {
+        _ = err catch {};
+    }
+
+    index_file.close();
     index_file = try vec_dir.createFile("INDEX", .{});
     defer index_file.close();
 
     try write_indexed_objs(index_file, indexed_objs);
-    try store_blob_obj(root_dir, objs_dir, indexed_objs[indexed_objs_idx]);
 }
 
 fn restore_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
@@ -1603,30 +1618,6 @@ fn restore_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
                 else return err;
             }
         }
-    }
-}
-
-fn restore_file(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
-    var root_dir = try get_root_dir(cwd);
-
-    var vec_dir = try root_dir.openDir(".vec", .{});
-    defer vec_dir.close();
-
-    var objs_dir = try vec_dir.openDir("objects", .{});
-    defer objs_dir.close();
-
-    const index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
-    const indexed_objs = try get_indexed_objs(allocator, index_file);
-    defer allocator.free(indexed_objs);
-    defer for (indexed_objs) |*o| o.deinit(); 
-
-    var file_obj = try get_obj_from_path(allocator, cwd, path);
-    defer file_obj.deinit();
-
-    const file_indexed_obj_idx = sort.binarySearch(Object, indexed_objs, file_obj, Object.compare_objs_by_name);
-    if (file_indexed_obj_idx) |idx| {
-        if (!mem.eql(u8, &indexed_objs[idx].hash, &file_obj.hash)) 
-                try fs.Dir.copyFile(objs_dir, &indexed_objs[idx].hash, cwd, path, .{});
     }
 }
 
