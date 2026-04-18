@@ -1561,51 +1561,48 @@ fn add_file_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !v
     try store_blob_obj(root_dir, objs_dir, indexed_objs[indexed_objs_idx]);
 }
 
-// BUG: cannot restore for deleted files
-// TODO: get indexed objects
-//      for all objects 
-//          if path of object contains the path parameter
-//              if file exists in working dir
-//                  get file object and compare hash
-//                  if hash is not same
-//                      copyFile from objects dir
-//              else
-//                  copyFile from objects dir
 fn restore_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
 
-    const full_path = try cwd.realpathAlloc(allocator, path);
+    const full_path = try fs.path.resolve(allocator, &.{root_path, path});
     defer allocator.free(full_path);
 
-    if (full_path.len < root_path.len or !mem.eql(u8, root_path, full_path[0..root_path.len])) {
+    if (full_path.len < root_path.len or !mem.startsWith(u8, full_path, root_path)) {
         debug.print("fatal: provided path '{s}' is outside working directory '{s}'\n", .{full_path, root_path});
         process.exit(1);
     }
 
-    const internal_path = if (full_path.len > root_path.len) full_path[root_path.len+1..] else ".";
+    const rel_path = if (full_path.len > root_path.len) full_path[root_path.len+1..] else "";
 
-    const s = try cwd.statFile(internal_path);
-    if (s.kind == .file) {
-        try restore_file(allocator, root_dir, internal_path);
-    } else if (s.kind != .directory) {
-        return;
-    }
+    var vec_dir = try root_dir.openDir(".vec", .{});
+    defer vec_dir.close();
 
-    var dir = try root_dir.openDir(internal_path, .{ .iterate = true });
-    defer if (full_path.len > root_path.len) dir.close();
-    var it = dir.iterate();
-    var entry = try it.next();
-    while (entry) |e| {
-        const child_full_path = try dir.realpathAlloc(allocator, e.name);
-        defer allocator.free(child_full_path); 
-        if (e.kind == .directory) 
-            try restore_path(allocator, root_dir, child_full_path[root_path.len+1..])
-        else if (e.kind == .file) 
-            try restore_file(allocator, root_dir, child_full_path[root_path.len+1..]);
-        
-        entry = try it.next();
+    var objs_dir = try vec_dir.openDir("objects", .{});
+    defer objs_dir.close();
+
+    const index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
+    const indexed_objs = try get_indexed_objs(allocator, index_file);
+    defer allocator.free(indexed_objs);
+    defer for (indexed_objs) |*o| o.deinit(); 
+
+    for (0..indexed_objs.len) |i| {
+        if (rel_path.len == 0 or mem.startsWith(u8, indexed_objs[i].name, rel_path)) {
+            if (root_dir.access(indexed_objs[i].name, .{})) {
+                var f = try root_dir.openFile(indexed_objs[i].name, .{ .mode = .read_only });
+                defer f.close();
+                var file_obj = try get_file_obj(allocator, null, indexed_objs[i].name, f);
+                defer file_obj.deinit();
+                if (!mem.eql(u8, &indexed_objs[i].hash, &file_obj.hash)) {
+                    try fs.Dir.copyFile(objs_dir, &indexed_objs[i].hash, root_dir, indexed_objs[i].name, .{});
+                }
+            } else |err| {
+                if (err == fs.Dir.AccessError.FileNotFound)
+                    try fs.Dir.copyFile(objs_dir, &indexed_objs[i].hash, root_dir, indexed_objs[i].name, .{})
+                else return err;
+            }
+        }
     }
 }
 
@@ -1895,7 +1892,7 @@ const EditGraph = struct {
 
     pub fn init(gpa: mem.Allocator, max: usize) !Self {
         var self = Self {.items = &[_]u32{}, .edits = undefined, .max = max};
-        self.items = try gpa.alloc(u32, 2*max+1);
+        self.items = try gpa.alloc(u32, 2*max+2);
         @memset(self.items, 0);
         return self;
     }
@@ -1904,12 +1901,12 @@ const EditGraph = struct {
     }
     pub fn get(self: *Self, i: i64) u32 {
         const idx: usize = @intCast(i + @as(i32, @intCast(self.max)));
-        debug.assert(idx >= 0 and idx < 2*self.max+1);
+        debug.assert(idx >= 0 and idx < 2*self.max+2);
         return self.items[idx];
     }
     pub fn set(self: *Self, i: i64, val: u32) void {
         const idx: usize = @intCast(i + @as(i32, @intCast(self.max)));
-        debug.assert(idx >= 0 and idx < 2*self.max+1);
+        debug.assert(idx >= 0 and idx < 2*self.max+2);
         self.items[idx] = val;
     }
     pub fn clone(self: *Self, gpa: mem.Allocator) !Self {
@@ -1975,17 +1972,6 @@ fn myers_diff(stdout: *std.Io.Writer, allocator: mem.Allocator, file_readers: *[
         while (k <= d) {
             var x: i64 = undefined;
             if (k == -d or (k != d and edit_graph.get(k-1) < edit_graph.get(k+1))) {
-                // BUG:
-                // 
-                // /home/akamikado/personal/projects/vec/src/main.zig:1893:21: 0x11c7ccb in get (main.zig)
-                //         debug.assert(idx >= 0 and idx < 2*self.max+1);
-                //                     ^
-                // /home/akamikado/personal/projects/vec/src/main.zig:1964:35: 0x118898a in myers_diff (main.zig)
-                //                 x = edit_graph.get(k + 1);
-                //                                   ^
-                // /home/akamikado/personal/projects/vec/src/main.zig:1870:35: 0x1196f53 in compare_file_with_indexed_obj 
-                // (main.zig)
-                //     const changed = try myers_diff(@constCast(stdout), allocator, &file_readers);
                 x = edit_graph.get(k + 1);
             } else {
                 x = edit_graph.get(k - 1) + 1;
