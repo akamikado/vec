@@ -22,6 +22,7 @@ A simple version control system written in [zig](https://ziglang.org/), built to
 - [x] Commit History
     - [x] View commit history
     - [x] Restore working directory to a previous commit snapshot
+- [ ] Stashing changes
 - [ ] Branching
     - [x] Creating and switching branches
     - [ ] Merging branches
