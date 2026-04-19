@@ -597,6 +597,28 @@ fn list_branches(allocator: mem.Allocator, cwd: fs.Dir) !void {
     }
 }
 
+fn delete_obj_from_working_dir(cwd: fs.Dir, obj: Object) !void {
+    if (obj.kind == .blob) {
+        try cwd.deleteFile(obj.name);
+        return;
+    }
+
+    for (0..obj.children.len) |i| {
+        if (obj.children[i].kind == .blob) {
+            try cwd.deleteFile(obj.children[i].name);
+        } else {
+            var d = try cwd.openDir(obj.children[i].name, .{ .iterate = true });
+            defer d.close();
+            try delete_obj_from_working_dir(d, obj.children[i]);
+            var it = d.iterate();
+            const entry = try it.next();
+            if (entry) |_| {} else {
+                try cwd.deleteDir(obj.children[i].name);
+            }
+        }
+    }
+}
+
 fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u8, new_branch: bool) !void {
     var root_dir = try get_root_dir(cwd);
 
@@ -664,12 +686,12 @@ fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u
     defer unstaged_changes.deinit(allocator);
 
     try compare_index_tree_with_current_tree(allocator, index_tree, current_tree, &unstaged_changes);
-    for (0..unstaged_changes.items.len) |i| {
-        if (unstaged_changes.items[i].status == .deleted or unstaged_changes.items[i].status == .modified) {
-            debug.print("fatal: your changes will be overwritten by checkout\n", .{});
-            return;
-        }
+    if (unstaged_changes.items.len > 0) {
+        debug.print("fatal: your changes will be overwritten by checkout\n", .{});
+        return;
     }
+
+    if (index_tree) |t| try delete_obj_from_working_dir(root_dir, t);
 
     try set_branch(vec_dir, target_branch);
     const target_commit_hash = try get_head(vec_dir);
@@ -688,8 +710,6 @@ fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u
     defer new_index_file.close();
     try write_indexed_objs(new_index_file, indexed_objs);
 
-    // BUG: doesn't delete items which weren't indexed
-    // TODO: should not use restore path, instead have to delete all files which are currently indexed and then rebuild whole commit from scratch
     try restore_path(allocator, root_dir, ".");
 
     debug.print("Switched to branch {s}\n", .{target_branch});
@@ -740,11 +760,9 @@ fn checkout_to_commit(allocator: mem.Allocator, cwd: fs.Dir, target_commit: []co
     defer unstaged_changes.deinit(allocator);
 
     try compare_index_tree_with_current_tree(allocator, index_tree, current_tree, &unstaged_changes);
-    for (0..unstaged_changes.items.len) |i| {
-        if (unstaged_changes.items[i].status == .deleted or unstaged_changes.items[i].status == .modified) {
-            debug.print("fatal: your changes will be overwritten by checkout\n", .{});
-            return;
-        }
+    if (unstaged_changes.items.len > 0) {
+        debug.print("fatal: your changes will be overwritten by checkout\n", .{});
+        return;
     }
 
     const target_tree_hash = try get_tree_for_commit(allocator, objs_dir, target_commit_hash);
@@ -756,14 +774,15 @@ fn checkout_to_commit(allocator: mem.Allocator, cwd: fs.Dir, target_commit: []co
     defer allocator.free(indexed_objs);
     defer for (0..indexed_objs.len) |i| indexed_objs[i].deinit();
 
+    if (index_tree) |t| try delete_obj_from_working_dir(root_dir, t);
+
     index_file.close();
     var new_index_file = try vec_dir.createFile("INDEX", .{});
     defer new_index_file.close();
     try write_indexed_objs(new_index_file, indexed_objs);
 
     try set_detached_head(vec_dir, target_commit_hash);
-    // BUG: doesn't delete items which weren't indexed
-    // TODO: should not use restore path, instead have to delete all files which are currently indexed and then rebuild whole commit from scratch
+
     try restore_path(allocator, root_dir, ".");
 
     debug.print("switched to commit {s} with detached HEAD\n", .{target_commit_hash});
@@ -1524,19 +1543,6 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
             i += 1;
         }
     }
-
-    var d = if (rel_path.len > 0) root_dir.openDir(rel_path, .{.iterate = true}) catch |err| {
-        if (err == fs.Dir.OpenError.NotDir) {
-            index_file.close();
-            index_file = try vec_dir.createFile("INDEX", .{});
-            defer index_file.close();
-
-            try write_indexed_objs(index_file, indexed_objs);
-            return;
-        }
-        return err;
-    } else root_dir;
-    defer if (rel_path.len > 0) d.close();
 
     var walker = try root_dir.walk(allocator);
     defer walker.deinit();
