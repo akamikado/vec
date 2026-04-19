@@ -23,6 +23,8 @@ A simple version control system written in [zig](https://ziglang.org/), built to
     - [x] View commit history
     - [x] Restore working directory to a previous commit snapshot
 - [ ] Branching
+    - [x] Creating and switching branches
+    - [ ] Merging branches
 - [ ] Object Compression: Reduce storage size of stored objects
 
 ## Limitations
