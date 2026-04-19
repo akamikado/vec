@@ -25,7 +25,6 @@ A simple version control system written in [zig](https://ziglang.org/), built to
 - [ ] Branching
     - [x] Creating and switching branches
     - [ ] Merging branches
-- [ ] Object Compression: Reduce storage size of stored objects
 
 ## Limitations
 - Only works on Linux
