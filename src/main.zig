@@ -84,7 +84,7 @@ pub fn main() !void {
                     try compare_commits(allocator, cwd, arg2, arg3);
                 } else {
                     if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
-                        debug.print("usage: vec diff <file>\n", .{});
+                        debug.print("usage: vec diff <path>\n", .{});
                         debug.print("       vec diff <commit> <commit>\n", .{});
                         return;
                     }
@@ -92,7 +92,7 @@ pub fn main() !void {
                 }
             } else {
                 debug.print("fatal: missing file path argument\n", .{});
-                debug.print("usage: vec diff <file>\n", .{});
+                debug.print("usage: vec diff <path>\n", .{});
                 debug.print("       vec diff <commit> <commit>\n", .{});
                 return;
             }

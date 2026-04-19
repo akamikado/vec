@@ -11,8 +11,8 @@ A simple version control system written in [zig](https://ziglang.org/), built to
 - Staging area: Supports staging area for preparing changes before committing
 - Commit: Creates snapshots of staged files and stores them as versioned objects
 - Log: Displays the history of commits in the repository
-- Restore: Restore file to previous snapshot version
-- Reset: Reset state of working to previous commit
+- Restore: Restore file or directory to previous snapshot version
+- Reset: Reset state of working directory to previous commit
 
 ## Planned Features
 - [x] Staging area
