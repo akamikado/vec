@@ -9,6 +9,12 @@ const fmt     = std.fmt;
 const math    = std.math;
 const sort    = std.sort;
 
+const vec_dir_name = ".vec";
+const objects_dir_name = "objects";
+const branches_dir_name = "branches";
+const head_file_name = "HEAD";
+const index_file_name = "INDEX";
+
 pub fn main() !void {
     var args = process.args();
     _ = args.next();
@@ -216,7 +222,7 @@ fn get_root_dir(cwd: fs.Dir) !fs.Dir {
     while (!found_root_dir and !mem.eql(u8, cwd_path, "/")) {
         dir = try dir.openDir("..", .{.iterate = true});
         cwd_path = try dir.realpath(".", &path_buf);
-        found_root_dir = if(dir.access(".vec/", .{.mode = .read_only})) |_| true else |_| false;
+        found_root_dir = if(dir.access(vec_dir_name, .{.mode = .read_only})) |_| true else |_| false;
     }
     if (!found_root_dir) {
         debug.print("fatal: not found in current directory (or any of the parent directories): .vec\n", .{});
@@ -227,7 +233,7 @@ fn get_root_dir(cwd: fs.Dir) !fs.Dir {
 }
 
 fn init_vec_dir(root_dir: fs.Dir) !void {
-    root_dir.makeDir(".vec") catch |err| {
+    root_dir.makeDir(vec_dir_name) catch |err| {
         switch (err) {
             error.PathAlreadyExists => {},
             else => return err
@@ -272,12 +278,12 @@ fn init_vec_dir(root_dir: fs.Dir) !void {
 
 fn get_head(vec_dir: fs.Dir) !?[40]u8 {
     var head_file_buf: [512]u8 = undefined;
-    const head_file = try vec_dir.openFile("HEAD", .{});
+    const head_file = try vec_dir.openFile(head_file_name, .{});
     var r1 = head_file.reader(&head_file_buf);
     const line1 = try r1.interface.takeDelimiter('\n');
     if (line1) |l1| {
         if (mem.startsWith(u8, l1, "ref:")) {
-            var branches_dir = try vec_dir.openDir("branches", .{});
+            var branches_dir = try vec_dir.openDir(branches_dir_name, .{});
             defer branches_dir.close();
 
             var branch_file = try branches_dir.openFile(l1[4..], .{ .mode =  .read_only });
@@ -308,7 +314,7 @@ fn get_head(vec_dir: fs.Dir) !?[40]u8 {
 
 fn get_branch(allocator: mem.Allocator, vec_dir: fs.Dir) !?[]const u8 {
     var head_file_buf: [512]u8 = undefined;
-    const head_file = try vec_dir.openFile("HEAD", .{});
+    const head_file = try vec_dir.openFile(head_file_name, .{});
     var r = head_file.reader(&head_file_buf);
     const line = try r.interface.takeDelimiter('\n');
 
@@ -463,19 +469,14 @@ const ObjectStatus = struct {
 fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var root_dir = try get_root_dir(cwd);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
     const branch = try get_branch(allocator, vec_dir);
     defer if (branch) |b| allocator.free(b);
-
-    if (branch) |_| {} else {
-        debug.print("Head is currently detached. Cannot check status\n", .{});
-        return;
-    }
 
     const head = try get_head(vec_dir);
     const tree = try get_tree_for_commit(allocator, objs_dir, head);
@@ -487,7 +488,7 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var current_tree = try construct_tree_from_dir(allocator, null, "", root_dir);
     defer current_tree.deinit();
 
-    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
+    var index_file = try vec_dir.openFile(index_file_name, .{ .mode = .read_only });
     defer index_file.close();
 
     var index_tree = try construct_tree_from_index(allocator, index_file);
@@ -521,7 +522,10 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
         }
     }
 
-    debug.print("On branch {s}\n\n", .{branch.?});
+    if (branch) |b| 
+        debug.print("On branch {s}\n\n", .{b})
+    else
+        debug.print("HEAD detached at commit {s}\n\n", .{head.?});
 
     if (staged_changes.items.len > 0) debug.print("Staged changes:\n", .{});
     for (staged_modified_objs.items) |i| {
@@ -572,7 +576,7 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
 fn list_branches(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var root_dir = try get_root_dir(cwd);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
     const current_branch = try get_branch(allocator, vec_dir);
@@ -583,7 +587,7 @@ fn list_branches(allocator: mem.Allocator, cwd: fs.Dir) !void {
         if (head) |h| debug.print("* (HEAD detached at {s})\n", .{h});
     }
 
-    var branches_dir = try vec_dir.openDir("branches", .{ .iterate = true });
+    var branches_dir = try vec_dir.openDir(branches_dir_name, .{ .iterate = true });
     defer branches_dir.close();
 
     var it = branches_dir.iterate();
@@ -622,7 +626,7 @@ fn delete_obj_from_working_dir(cwd: fs.Dir, obj: Object) !void {
 fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u8, new_branch: bool) !void {
     var root_dir = try get_root_dir(cwd);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
     const current_branch = try get_branch(allocator, vec_dir);
@@ -633,10 +637,10 @@ fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u
         return;
     };
 
-    var objs_dir = try vec_dir.openDir("objects", .{ .iterate = true });
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{ .iterate = true });
     defer objs_dir.close();
 
-    var branches_dir = try vec_dir.openDir("branches", .{ .iterate = true });
+    var branches_dir = try vec_dir.openDir(branches_dir_name, .{ .iterate = true });
     defer branches_dir.close();
 
     if (new_branch) {
@@ -668,7 +672,7 @@ fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u
     var current_tree = try construct_tree_from_dir(allocator, null, "", root_dir);
     defer current_tree.deinit();
 
-    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
+    var index_file = try vec_dir.openFile(index_file_name, .{ .mode = .read_only });
 
     var index_tree = try construct_tree_from_index(allocator, index_file);
     defer if (index_tree) |*t| t.deinit();
@@ -706,7 +710,7 @@ fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u
     defer for (0..indexed_objs.len) |i| indexed_objs[i].deinit();
 
     index_file.close();
-    var new_index_file = try vec_dir.createFile("INDEX", .{});
+    var new_index_file = try vec_dir.createFile(index_file_name, .{});
     defer new_index_file.close();
     try write_indexed_objs(new_index_file, indexed_objs);
 
@@ -718,10 +722,10 @@ fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u
 fn checkout_to_commit(allocator: mem.Allocator, cwd: fs.Dir, target_commit: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
 
-    var vec_dir = try root_dir.openDir(".vec", .{ .iterate = true });
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{ .iterate = true });
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{ .iterate = true });
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{ .iterate = true });
     defer objs_dir.close();
 
     var target_commit_hash: [40]u8 = undefined;
@@ -742,7 +746,7 @@ fn checkout_to_commit(allocator: mem.Allocator, cwd: fs.Dir, target_commit: []co
     var current_tree = try construct_tree_from_dir(allocator, null, "", root_dir);
     defer current_tree.deinit();
 
-    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
+    var index_file = try vec_dir.openFile(index_file_name, .{ .mode = .read_only });
 
     var index_tree = try construct_tree_from_index(allocator, index_file);
     defer if (index_tree) |*t| t.deinit();
@@ -777,7 +781,7 @@ fn checkout_to_commit(allocator: mem.Allocator, cwd: fs.Dir, target_commit: []co
     if (index_tree) |t| try delete_obj_from_working_dir(root_dir, t);
 
     index_file.close();
-    var new_index_file = try vec_dir.createFile("INDEX", .{});
+    var new_index_file = try vec_dir.createFile(index_file_name, .{});
     defer new_index_file.close();
     try write_indexed_objs(new_index_file, indexed_objs);
 
@@ -853,7 +857,7 @@ fn construct_tree_from_dir(allocator: mem.Allocator, parent: ?*Object, name: []c
     var it = d.iterate();
     var entry = try it.next();
     while (entry) |e| {
-        if (mem.eql(u8, e.name, ".vec")) {
+        if (mem.eql(u8, e.name, vec_dir_name)) {
             entry = try it.next();
             continue;
         }
@@ -1095,10 +1099,10 @@ fn compare_index_tree_with_current_tree(allocator: mem.Allocator, index_tree: ?O
 fn snapshot_index(allocator: mem.Allocator, cwd: fs.Dir, msg: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
+    var index_file = try vec_dir.openFile(index_file_name, .{ .mode = .read_only });
     defer index_file.close();
 
     var index_tree = try construct_tree_from_index(allocator, index_file);
@@ -1117,19 +1121,19 @@ fn snapshot_index(allocator: mem.Allocator, cwd: fs.Dir, msg: []const u8) !void 
 fn snapshot_tree(allocator: mem.Allocator, cwd:fs.Dir, tree: Object, msg: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
-    const branch = try get_branch(allocator, vec_dir);
-    defer if (branch) |b| allocator.free(b);
-
-    if (branch) |_| {} else {
-        debug.print("Head is currently detached. Cannot create commits\n", .{});
+    const current_branch = try get_branch(allocator, vec_dir);
+    if (current_branch) |_| {} else {
+        debug.print("fatal: head is currently detached, cannot create commits\n", .{});
+        debug.print("tip:   create new branch using `vec checkout --new <branch>`\n", .{});
         return;
     }
+    defer allocator.free(current_branch.?);
 
     const head = try get_head(vec_dir);
     const head_tree = try get_tree_for_commit(allocator, objs_dir, head);
@@ -1241,7 +1245,7 @@ fn write_indexed_objs(index_file: fs.File, objs: []Object) !void {
 }
 
 fn set_branch(vec_dir: fs.Dir, target_branch: []const u8) !void {
-    var head_file = try vec_dir.openFile("HEAD", .{ .mode = .write_only });
+    var head_file = try vec_dir.createFile(head_file_name, .{});
     defer head_file.close();
 
     var buf: [512]u8 = undefined;
@@ -1251,7 +1255,7 @@ fn set_branch(vec_dir: fs.Dir, target_branch: []const u8) !void {
 }
 
 fn set_detached_head(vec_dir: fs.Dir, new_head: [40]u8) !void {
-    var head_file = try vec_dir.createFile("HEAD", .{});
+    var head_file = try vec_dir.createFile(head_file_name, .{});
     defer head_file.close();
 
     var head_write_buf: [64]u8 = undefined;
@@ -1262,10 +1266,10 @@ fn set_detached_head(vec_dir: fs.Dir, new_head: [40]u8) !void {
 }
 
 fn set_head(vec_dir: fs.Dir, new_head: [40]u8) !void {
-    var head_file = try vec_dir.openFile("HEAD", .{ .mode = .read_write });
+    var head_file = try vec_dir.openFile(head_file_name, .{ .mode = .read_write });
     defer head_file.close();
 
-    var branches_dir = try vec_dir.openDir("branches", .{});
+    var branches_dir = try vec_dir.openDir(branches_dir_name, .{});
     defer branches_dir.close();
 
     var head_file_read_buf: [512]u8 = undefined;
@@ -1292,10 +1296,10 @@ fn set_head(vec_dir: fs.Dir, new_head: [40]u8) !void {
 fn list_commits(allocator: mem.Allocator, cwd: fs.Dir) !void {
     var root_dir = try get_root_dir(cwd);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
     const head = try get_head(vec_dir);
@@ -1319,10 +1323,10 @@ fn list_commits(allocator: mem.Allocator, cwd: fs.Dir) !void {
 fn reset_soft(cwd: fs.Dir, commit: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
     var target_commit: [40]u8 = undefined;
@@ -1358,10 +1362,10 @@ fn reset_hard(allocator: mem.Allocator, cwd: fs.Dir, commit: []const u8) !void {
 fn reset_mixed(allocator: mem.Allocator, cwd: fs.Dir, commit: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
     var target_commit: [40]u8 = undefined;
@@ -1382,7 +1386,7 @@ fn reset_mixed(allocator: mem.Allocator, cwd: fs.Dir, commit: []const u8) !void 
     var current_tree = try construct_tree_from_dir(allocator, null, "", root_dir);
     defer current_tree.deinit();
 
-    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_only });
+    var index_file = try vec_dir.openFile(index_file_name, .{ .mode = .read_only });
 
     var index_tree = try construct_tree_from_index(allocator, index_file);
     defer if (index_tree) |*t| t.deinit();
@@ -1435,7 +1439,7 @@ fn reset_mixed(allocator: mem.Allocator, cwd: fs.Dir, commit: []const u8) !void 
     defer for (0..indexed_objs.len) |i| indexed_objs[i].deinit();
 
     index_file.close();
-    var new_index_file = try vec_dir.createFile("INDEX", .{});
+    var new_index_file = try vec_dir.createFile(index_file_name, .{});
     defer new_index_file.close();
     try write_indexed_objs(new_index_file, indexed_objs);
     try set_head(vec_dir, target_commit);
@@ -1506,13 +1510,13 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     const rel_path = if (full_path.len > root_path.len) full_path[root_path.len+1..] else "";
     if (rel_path.len > 0) try root_dir.access(rel_path, .{});
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
-    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
+    var index_file = try vec_dir.openFile(index_file_name, .{ .mode = .read_write });
     var indexed_objs = try get_indexed_objs(allocator, index_file);
     defer allocator.free(indexed_objs);
     defer for (indexed_objs) |*o| o.deinit(); 
@@ -1549,7 +1553,7 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
 
     while(walker.next()) |e| {
         if (e) |entry| {
-            if (mem.startsWith(u8, entry.path, ".vec") or entry.kind == .directory) continue;
+            if (mem.startsWith(u8, entry.path, vec_dir_name) or entry.kind == .directory) continue;
             if (!mem.startsWith(u8, entry.path, rel_path)) continue;
             if (sort.binarySearch(Object, indexed_objs, entry.path, Object.compare_obj_to_name)) |_| {} else {
                 var f = try root_dir.openFile(entry.path, .{.mode = .read_only});
@@ -1576,7 +1580,7 @@ fn add_to_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     }
 
     index_file.close();
-    index_file = try vec_dir.createFile("INDEX", .{});
+    index_file = try vec_dir.createFile(index_file_name, .{});
     defer index_file.close();
 
     try write_indexed_objs(index_file, indexed_objs);
@@ -1597,13 +1601,13 @@ fn restore_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
 
     const rel_path = if (full_path.len > root_path.len) full_path[root_path.len+1..] else "";
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
-    const index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
+    const index_file = try vec_dir.openFile(index_file_name, .{ .mode = .read_write });
     const indexed_objs = try get_indexed_objs(allocator, index_file);
     defer allocator.free(indexed_objs);
     defer for (indexed_objs) |*o| o.deinit(); 
@@ -1634,6 +1638,7 @@ fn restore_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     }
 }
 
+// BUG: doesn't restore deleted changes
 fn restore_index_for_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
     const root_path = try root_dir.realpathAlloc(allocator, ".");
@@ -1673,13 +1678,13 @@ fn restore_index_for_path(allocator: mem.Allocator, cwd: fs.Dir, path: []const u
 }
 
 fn restore_index_for_file(allocator: mem.Allocator, root_dir: fs.Dir, path: []const u8) !void {
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
-    var index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
+    var index_file = try vec_dir.openFile(index_file_name, .{ .mode = .read_write });
     var indexed_objs = try get_indexed_objs(allocator, index_file);
     defer allocator.free(indexed_objs);
     defer for (indexed_objs) |*o| o.deinit(); 
@@ -1688,7 +1693,7 @@ fn restore_index_for_file(allocator: mem.Allocator, root_dir: fs.Dir, path: []co
     const indexed_objs_idx = sort.binarySearch(Object, indexed_objs, path, Object.compare_obj_to_name);
     if (indexed_objs_idx) |_| {} else { return; }
 
-    index_file = try vec_dir.createFile("INDEX", .{});
+    index_file = try vec_dir.createFile(index_file_name, .{});
     defer index_file.close();
     
     const tree_hash = try get_tree_for_commit(allocator, objs_dir, try get_head(vec_dir));
@@ -1741,10 +1746,10 @@ fn restore_index_for_file(allocator: mem.Allocator, root_dir: fs.Dir, path: []co
 fn compare_commits(allocator: mem.Allocator, cwd: fs.Dir, commit1: []const u8, commit2: []const u8) !void {
     var root_dir = try get_root_dir(cwd);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
     var commit1_hash: [40]u8 = undefined;
@@ -1807,10 +1812,10 @@ fn compare_path_with_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const 
     const root_path = try root_dir.realpathAlloc(allocator, ".");
     defer allocator.free(root_path);
 
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
     const full_path = try cwd.realpathAlloc(allocator, path);
@@ -1849,13 +1854,13 @@ fn compare_path_with_index(allocator: mem.Allocator, cwd: fs.Dir, path: []const 
 }
 
 fn compare_file_with_indexed_obj(allocator: mem.Allocator, root_dir: fs.Dir, file_path: []const u8, no_output: bool) !bool {
-    var vec_dir = try root_dir.openDir(".vec", .{});
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{});
     defer vec_dir.close();
 
-    var objs_dir = try vec_dir.openDir("objects", .{});
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{});
     defer objs_dir.close();
 
-    const index_file = try vec_dir.openFile("INDEX", .{ .mode = .read_write });
+    const index_file = try vec_dir.openFile(index_file_name, .{ .mode = .read_write });
     const indexed_objs = try get_indexed_objs(allocator, index_file);
     defer allocator.free(indexed_objs);
     defer for (indexed_objs) |*o| o.deinit(); 
