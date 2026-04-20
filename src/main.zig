@@ -362,7 +362,7 @@ fn get_parent_commit(objs_dir: fs.Dir, commit: [40]u8) !?[40]u8 {
     return buf;
 }
 
-fn get_tree_for_commit(allocator: mem.Allocator, objs_dir: fs.Dir, commit: ?[40]u8) !?[]u8 {
+fn get_tree_hash_for_commit(allocator: mem.Allocator, objs_dir: fs.Dir, commit: ?[40]u8) !?[]u8 {
     if (commit) |c| {
         var commit_file_buf: [128]u8 = undefined;
         var commit_file = try objs_dir.openFile(&c, .{ .mode = .read_only });
@@ -479,7 +479,7 @@ fn check_status(allocator: mem.Allocator, cwd: fs.Dir) !void {
     defer if (branch) |b| allocator.free(b);
 
     const head = try get_head(vec_dir);
-    const tree = try get_tree_for_commit(allocator, objs_dir, head);
+    const tree = try get_tree_hash_for_commit(allocator, objs_dir, head);
     defer if (tree) |t| allocator.free(t);
 
     var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
@@ -663,7 +663,7 @@ fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u
     }
 
     const head = try get_head(vec_dir);
-    const tree = try get_tree_for_commit(allocator, objs_dir, head);
+    const tree = try get_tree_hash_for_commit(allocator, objs_dir, head);
     defer if (tree) |t| allocator.free(t);
 
     var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
@@ -700,7 +700,7 @@ fn switch_branch(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u
     try set_branch(vec_dir, target_branch);
     const target_commit_hash = try get_head(vec_dir);
 
-    const target_tree_hash = try get_tree_for_commit(allocator, objs_dir, target_commit_hash);
+    const target_tree_hash = try get_tree_hash_for_commit(allocator, objs_dir, target_commit_hash);
     defer if (target_tree_hash) |t| allocator.free(t);
     var target_tree = try construct_tree_from_hash(allocator, objs_dir, target_tree_hash);
     defer if (target_tree) |*t| t.deinit();
@@ -737,7 +737,7 @@ fn checkout_to_commit(allocator: mem.Allocator, cwd: fs.Dir, target_commit: []co
     }
 
     const head = try get_head(vec_dir);
-    const tree = try get_tree_for_commit(allocator, objs_dir, head);
+    const tree = try get_tree_hash_for_commit(allocator, objs_dir, head);
     defer if (tree) |t| allocator.free(t);
 
     var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
@@ -769,7 +769,7 @@ fn checkout_to_commit(allocator: mem.Allocator, cwd: fs.Dir, target_commit: []co
         return;
     }
 
-    const target_tree_hash = try get_tree_for_commit(allocator, objs_dir, target_commit_hash);
+    const target_tree_hash = try get_tree_hash_for_commit(allocator, objs_dir, target_commit_hash);
     defer if (target_tree_hash) |t| allocator.free(t);
     var target_tree = try construct_tree_from_hash(allocator, objs_dir, target_tree_hash);
     defer if (target_tree) |*t| t.deinit();
@@ -1131,7 +1131,7 @@ fn snapshot_tree(allocator: mem.Allocator, cwd:fs.Dir, tree: Object, msg: []cons
     defer allocator.free(current_branch.?);
 
     const head = try get_head(vec_dir);
-    const head_tree = try get_tree_for_commit(allocator, objs_dir, head);
+    const head_tree = try get_tree_hash_for_commit(allocator, objs_dir, head);
     defer if (head_tree) |t| allocator.free(t);
 
     if (head_tree) |ht| {
@@ -1147,6 +1147,8 @@ fn snapshot_tree(allocator: mem.Allocator, cwd:fs.Dir, tree: Object, msg: []cons
     if (current_branch) |_| {
         try set_head(vec_dir, new_commit);
     } else {
+        debug.print("warning: commit may be lost if new branch is not created\n", .{});
+        debug.print("         use `vec checkout --new <branch>` to create new branch\n", .{});
         try set_detached_head(vec_dir, new_commit);
     }
 }
@@ -1284,7 +1286,8 @@ fn set_head(vec_dir: fs.Dir, new_head: [40]u8) !void {
             try w.interface.print("{s}", .{new_head});
             try w.interface.flush();
         } else {
-            debug.assert(false and "must always set_branch before doing set_head or use set_detached_head instead\n");
+            // must always set_branch before doing set_head or use set_detached_head instead\n
+            unreachable;
         }
     } else {
         debug.print("fatal: HEAD has been corrupted\n", .{});
@@ -1376,7 +1379,7 @@ fn reset_mixed(allocator: mem.Allocator, cwd: fs.Dir, commit: []const u8) !void 
     }
 
     const head = try get_head(vec_dir);
-    const tree = try get_tree_for_commit(allocator, objs_dir, head);
+    const tree = try get_tree_hash_for_commit(allocator, objs_dir, head);
     defer if (tree) |t| allocator.free(t);
 
     var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree); 
@@ -1428,7 +1431,7 @@ fn reset_mixed(allocator: mem.Allocator, cwd: fs.Dir, commit: []const u8) !void 
         return;
     }
 
-    const target_tree_hash = try get_tree_for_commit(allocator, objs_dir, target_commit);
+    const target_tree_hash = try get_tree_hash_for_commit(allocator, objs_dir, target_commit);
     defer if (target_tree_hash) |t| allocator.free(t);
     var target_tree = try construct_tree_from_hash(allocator, objs_dir, target_tree_hash);
     defer if (target_tree) |*t| t.deinit();
@@ -1695,7 +1698,7 @@ fn restore_index_for_file(allocator: mem.Allocator, root_dir: fs.Dir, path: []co
     index_file = try vec_dir.createFile(index_file_name, .{});
     defer index_file.close();
     
-    const tree_hash = try get_tree_for_commit(allocator, objs_dir, try get_head(vec_dir));
+    const tree_hash = try get_tree_hash_for_commit(allocator, objs_dir, try get_head(vec_dir));
     defer if (tree_hash) |t| allocator.free(t);
 
     var commit_tree = try construct_tree_from_hash(allocator, objs_dir, tree_hash);
@@ -1767,12 +1770,12 @@ fn compare_commits(allocator: mem.Allocator, cwd: fs.Dir, commit1: []const u8, c
         return;
     }
 
-    const tree1_hash = try get_tree_for_commit(allocator, objs_dir, commit1_hash);
+    const tree1_hash = try get_tree_hash_for_commit(allocator, objs_dir, commit1_hash);
     defer if (tree1_hash) |h| allocator.free(h);
     var tree1 = try construct_tree_from_hash(allocator, objs_dir, tree1_hash);
     defer if (tree1) |*t1| t1.deinit();
 
-    const tree2_hash = try get_tree_for_commit(allocator, objs_dir, commit2_hash);
+    const tree2_hash = try get_tree_hash_for_commit(allocator, objs_dir, commit2_hash);
     defer if (tree2_hash) |h| allocator.free(h);
     var tree2 = try construct_tree_from_hash(allocator, objs_dir, tree2_hash);
     defer if (tree2) |*t2| t2.deinit();
@@ -1800,8 +1803,9 @@ fn compare_commits(allocator: mem.Allocator, cwd: fs.Dir, commit1: []const u8, c
             const stdout = &stdout_writer.interface;
 
             try stdout.print("{s}\n", .{changes.items[i].obj1.name});
-            try stdout.flush();
-            _ = try myers_diff(@constCast(stdout), allocator, &file_readers);
+            const changed = try myers_diff(@constCast(stdout), allocator, &file_readers);
+            if (!changed) try stdout.noopFlush()
+            else try stdout.flush();
         }
     }
 }
