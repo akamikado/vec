@@ -1128,11 +1128,6 @@ fn snapshot_tree(allocator: mem.Allocator, cwd:fs.Dir, tree: Object, msg: []cons
     defer objs_dir.close();
 
     const current_branch = try get_branch(allocator, vec_dir);
-    if (current_branch) |_| {} else {
-        debug.print("fatal: head is currently detached, cannot create commits\n", .{});
-        debug.print("tip:   create new branch using `vec checkout --new <branch>`\n", .{});
-        return;
-    }
     defer allocator.free(current_branch.?);
 
     const head = try get_head(vec_dir);
@@ -1149,7 +1144,11 @@ fn snapshot_tree(allocator: mem.Allocator, cwd:fs.Dir, tree: Object, msg: []cons
 
     try store_tree_obj(root_dir, objs_dir, tree);
     const new_commit = try write_commit_obj(objs_dir, head, tree.hash, msg);
-    try set_head(vec_dir, new_commit);
+    if (current_branch) |_| {
+        try set_head(vec_dir, new_commit);
+    } else {
+        try set_detached_head(vec_dir, new_commit);
+    }
 }
 
 fn store_blob_obj(root_dir: fs.Dir, objs_dir: fs.Dir, blob_obj: Object) !void {
