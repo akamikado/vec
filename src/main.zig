@@ -931,7 +931,6 @@ fn construct_tree_from_index(allocator: mem.Allocator, index_file: fs.File) !?Ob
     var reader = &r.interface;
 
     while (reader.takeDelimiter('\n')) |line| {
-        // TODO: make this logic simpler, because lines are sorted by name
         if (line) |l| {
             var it = mem.splitScalar(u8, l, ' ');
             const obj_hash = it.next().?;
@@ -2408,6 +2407,8 @@ fn merge_branch_with_current(allocator: mem.Allocator, cwd: fs.Dir, target_branc
     defer allocator.free(msg);
 
     try snapshot_index(allocator, cwd, msg);
+
+    try restore_path(allocator, root_dir, ".");
 
     debug.print("merged branch {s} into {s}\n", .{target_branch, current_branch.?});
 }
