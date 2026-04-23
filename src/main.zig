@@ -159,7 +159,6 @@ pub fn main() !void {
             }
             try list_commits(allocator, cwd);
         } else if (mem.eql(u8, arg, "reset")) {
-            // TODO: check if you can do reset while in detached head
             if (args.next()) |arg2| {
                 if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
                     debug.print("usage: vec reset <commit>\n", .{});
@@ -209,15 +208,17 @@ pub fn main() !void {
                 \\usage: vec <command> [<args>]
                 \\
                 \\Available commands:
-                \\  init:    Create a working area
-                \\  status:  Show the working tree status
-                \\  branch:  List all branches
-                \\  diff:    Show changes between working tree and commit
-                \\  add:     Add file contents to index
-                \\  restore: Restore working tree files
-                \\  commit:  Record changes to the working area
-                \\  log:     Show commit logs
-                \\  reset:   Reset current HEAD to specified state
+                \\  init:     Create a working area
+                \\  status:   Show the working tree status
+                \\  branch:   List all branches
+                \\  diff:     Show changes between working tree and commit
+                \\  add:      Add file contents to index
+                \\  restore:  Restore working tree files
+                \\  commit:   Record changes to the working area
+                \\  log:      Show commit logs
+                \\  reset:    Reset current HEAD to specified state
+                \\  checkout: Create or switch to branch
+                \\  merge:    Merge branch with current branch
             ;
             debug.print("{s}\n", .{help_str});
         } else {
