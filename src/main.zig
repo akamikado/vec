@@ -159,6 +159,7 @@ pub fn main() !void {
             }
             try list_commits(allocator, cwd);
         } else if (mem.eql(u8, arg, "reset")) {
+            // TODO: check if you can do reset while in detached head
             if (args.next()) |arg2| {
                 if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
                     debug.print("usage: vec reset <commit>\n", .{});
@@ -188,6 +189,19 @@ pub fn main() !void {
             } else {
                 debug.print("fatal: missing commit hash argument\n", .{});
                 debug.print("usage: vec reset <commit hash>\n", .{});
+                return;
+            }
+        } else if (mem.eql(u8, arg, "merge")) {
+            if (args.next()) |arg2| {
+                if (mem.eql(u8, arg2, "-h") or mem.eql(u8, arg2, "--help")) {
+                    debug.print("usage: vec merge <branch>\n", .{});
+                    return;
+                } else {
+                    try merge_branch_with_current(allocator, cwd, arg2);
+                }
+            } else {
+                debug.print("fatal: missing branch argument\n", .{});
+                debug.print("usage: vec merge <branch>\n", .{});
                 return;
             }
         } else if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help") or mem.eql(u8, arg, "help")) {
@@ -329,6 +343,24 @@ fn get_branch(allocator: mem.Allocator, vec_dir: fs.Dir) !?[]const u8 {
         debug.print("fatal: HEAD has been corrupted\n", .{});
         return error.CorruptedHead;
     }
+}
+
+fn get_branch_head(branches_dir: fs.Dir, branch: []const u8) !?[40]u8 {
+    var branch_file = try branches_dir.openFile(branch, .{ .mode =  .read_only });
+    defer branch_file.close();
+
+    var branch_file_buf: [64]u8 = undefined;
+    var r2 = branch_file.reader(&branch_file_buf);
+
+    const line2 = try r2.interface.takeDelimiter('\n');
+    if (line2) |l2| {
+        var buf: [40]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try w.print("{s}", .{l2});
+        try w.flush();
+        return buf;
+    }
+    return null;
 }
 
 fn branch_exists(branches_dir: fs.Dir, branch: []const u8) bool {
@@ -2094,4 +2126,288 @@ fn myers_diff(stdout: *std.Io.Writer, allocator: mem.Allocator, file_readers: *[
     try file_readers[1].seekTo(0);
 
     return true;
+}
+
+fn get_common_ancestor_commit(objs_dir: fs.Dir, commit1: [40]u8, commit2: [40]u8) ![40]u8 {
+    var p = try get_parent_commit(objs_dir, commit1);
+    var q = try get_parent_commit(objs_dir, commit2);
+
+    while (true) {
+        if (p) |_| 
+            if (q) |_| 
+                if (mem.eql(u8, &p.?, &q.?)) break;
+        if (p) |_| 
+            p = try get_parent_commit(objs_dir, p.?)
+        else
+            p = commit2;
+        if (q) |_|
+            q = try get_parent_commit(objs_dir, q.?)
+        else
+            q = commit1;
+    }
+    if (p) |_| 
+        return p.?
+    else 
+        unreachable;
+}
+
+fn merge_branch_with_current(allocator: mem.Allocator, cwd: fs.Dir, target_branch: []const u8) !void {
+    var root_dir = try get_root_dir(cwd);
+
+    var vec_dir = try root_dir.openDir(vec_dir_name, .{ .iterate = true });
+    defer vec_dir.close();
+
+    var objs_dir = try vec_dir.openDir(objects_dir_name, .{ .iterate = true });
+    defer objs_dir.close();
+
+    var branches_dir = try vec_dir.openDir(branches_dir_name, .{ .iterate = true });
+    defer branches_dir.close();
+    if (!branch_exists(branches_dir, target_branch)) {
+        debug.print("fatal: branch {s} does not exist\n", .{target_branch});
+        return;
+    }
+
+    const current_branch = try get_branch(allocator, vec_dir);
+    if (current_branch) |_| {} else {
+        debug.print("fatal: head is currently detached, cannot use merge\n", .{});
+        debug.print("tip:   create new branch using `vec checkout --new <branch>`\n", .{});
+        return;
+    }
+    defer allocator.free(current_branch.?);
+
+    const current_head = try get_head(vec_dir);
+    const current_tree_hash = try get_tree_hash_for_commit(allocator, objs_dir, current_head);
+    defer if (current_tree_hash) |t| allocator.free(t);
+
+    var commit_tree = try construct_tree_from_hash(allocator, objs_dir, current_tree_hash); 
+    defer if (commit_tree) |*t| t.deinit();
+
+    var current_tree = try construct_tree_from_dir(allocator, null, "", root_dir);
+    defer current_tree.deinit();
+
+    const index_file = try vec_dir.openFile(index_file_name, .{ .mode = .read_only });
+
+    var index_tree = try construct_tree_from_index(allocator, index_file);
+    defer if (index_tree) |*t| t.deinit();
+
+    var staged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer staged_changes.deinit(allocator);
+
+    if (index_tree) |t| try compare_index_tree_with_commit_tree(allocator, t, commit_tree, &staged_changes);
+    if (staged_changes.items.len > 0) {
+        debug.print("fatal: your changes will be overwritten by checkout\n", .{});
+        index_file.close();
+        return;
+    }
+
+    var unstaged_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+    defer unstaged_changes.deinit(allocator);
+
+    try compare_index_tree_with_current_tree(allocator, index_tree, current_tree, &unstaged_changes);
+    if (unstaged_changes.items.len > 0) {
+        debug.print("fatal: your changes will be overwritten by checkout\n", .{});
+        index_file.close();
+        return;
+    }
+
+    if (!branch_exists(branches_dir, target_branch)) {
+        debug.print("fatal: branch {s} does not exist\n", .{target_branch});
+        index_file.close();
+        return;
+    }
+
+    const target_branch_head = try get_branch_head(branches_dir, target_branch);
+
+    if (target_branch_head) |_| {} else {
+        debug.print("no changes to merge from branch {s}\n", .{target_branch});
+        index_file.close();
+        return;
+    }
+
+    const target_tree_hash = try get_tree_hash_for_commit(allocator, objs_dir, target_branch_head.?);
+    defer allocator.free(target_tree_hash.?);
+
+    var target_tree = try construct_tree_from_hash(allocator, objs_dir, target_tree_hash.?);
+    defer target_tree.?.deinit();
+
+    const target_indexed_objs = try flatten_tree_obj(allocator, target_tree.?, "");
+    defer allocator.free(target_indexed_objs);
+    defer for (0..target_indexed_objs.len) |i| target_indexed_objs[i].deinit();
+
+    if (current_head) |_| {
+        const current_indexed_objs = try get_indexed_objs(allocator, index_file);
+        defer allocator.free(current_indexed_objs);
+        defer for (current_indexed_objs) |*o| o.deinit(); 
+
+        const lca_commit = try get_common_ancestor_commit(objs_dir, current_head.?, target_branch_head.?);
+
+        const lca_tree_hash = try get_tree_hash_for_commit(allocator, objs_dir, lca_commit);
+        defer allocator.free(lca_tree_hash.?);
+
+        var lca_tree = try construct_tree_from_hash(allocator, objs_dir, lca_tree_hash.?);
+        defer lca_tree.?.deinit();
+
+        const lca_indexed_objs = try flatten_tree_obj(allocator, lca_tree.?, "");
+        defer allocator.free(lca_indexed_objs);
+        defer for (0..lca_indexed_objs.len) |i| lca_indexed_objs[i].deinit();
+
+        var current_branch_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+        defer current_branch_changes.deinit(allocator);
+
+        var i: usize = 0;
+        var j: usize = 0;
+
+        while (i < lca_indexed_objs.len and j < current_indexed_objs.len) {
+            if (mem.eql(u8, lca_indexed_objs[i].name, current_indexed_objs[j].name)) {
+                if (!mem.eql(u8, &lca_indexed_objs[i].hash, &current_indexed_objs[j].hash)) {
+                    try current_branch_changes.append(allocator, .{ .obj1 = lca_indexed_objs[i], .obj2 = current_indexed_objs[j], .status = .modified });
+                }
+                i += 1;
+                j += 1;
+            } else if (Object.lessThanFn({}, lca_indexed_objs[i], current_indexed_objs[j])) {
+                try current_branch_changes.append(allocator, .{ .obj1 = lca_indexed_objs[i], .status = .deleted });
+                i += 1;
+            } else {
+                try current_branch_changes.append(allocator, .{ .obj1 = current_indexed_objs[j], .status = .untracked });
+                j += 1;
+            }
+        }
+
+        while (i < lca_indexed_objs.len) {
+            try current_branch_changes.append(allocator, .{ .obj1 = lca_indexed_objs[i], .status = .deleted });
+            i += 1;
+        }
+
+        while (j < current_indexed_objs.len) {
+            try current_branch_changes.append(allocator, .{ .obj1 = current_indexed_objs[j], .status = .untracked });
+            j += 1;
+        }
+
+        var target_branch_changes = try std.ArrayList(ObjectStatus).initCapacity(allocator, 8);
+        defer target_branch_changes.deinit(allocator);
+
+        i = 0;
+        j = 0;
+
+        while (i < lca_indexed_objs.len and j < target_indexed_objs.len) {
+            if (mem.eql(u8, lca_indexed_objs[i].name, target_indexed_objs[j].name)) {
+                if (!mem.eql(u8, &lca_indexed_objs[i].hash, &target_indexed_objs[j].hash)) {
+                    try target_branch_changes.append(allocator, .{ .obj1 = lca_indexed_objs[i], .obj2 = target_indexed_objs[j], .status = .modified });
+                }
+                i += 1;
+                j += 1;
+            } else if (Object.lessThanFn({}, lca_indexed_objs[i], target_indexed_objs[j])) {
+                try target_branch_changes.append(allocator, .{ .obj1 = lca_indexed_objs[i], .status = .deleted });
+                i += 1;
+            } else {
+                try target_branch_changes.append(allocator, .{ .obj1 = target_indexed_objs[j], .status = .untracked });
+                j += 1;
+            }
+        }
+
+        while (i < lca_indexed_objs.len) {
+            try target_branch_changes.append(allocator, .{ .obj1 = lca_indexed_objs[i], .status = .deleted });
+            i += 1;
+        }
+
+        while (j < target_indexed_objs.len) {
+            try target_branch_changes.append(allocator, .{ .obj1 = target_indexed_objs[j], .status = .untracked });
+            j += 1;
+        }
+
+        i = 0;
+        j = 0;
+
+        var conflict = false;
+        while (i < current_branch_changes.items.len and j < target_branch_changes.items.len) {
+            if (mem.eql(u8, current_branch_changes.items[i].obj1.name, target_branch_changes.items[j].obj1.name)) {
+                switch (current_branch_changes.items[i].status) {
+                    .modified => {
+                        if (target_branch_changes.items[j].status == .modified and !mem.eql(u8, &current_branch_changes.items[i].obj2.?.hash, &target_branch_changes.items[j].obj2.?.hash)) {
+                            // CONFLICT
+                            // conflict if modified in target and hash is different
+                            conflict = true;
+                            break;
+                        } else if (target_branch_changes.items[j].status == .deleted) {
+                            // conflict if deleted in target
+                            conflict = true;
+                            break;
+                        }
+                    },
+                    .untracked => {
+                        if (target_branch_changes.items[j].status == .untracked and !mem.eql(u8, &current_branch_changes.items[i].obj1.hash, &target_branch_changes.items[j].obj1.hash)) {
+                            // conflict if untracked but different hash
+                            conflict = true;
+                            break;
+                        }
+                    },
+                    .deleted => {
+                        if (target_branch_changes.items[j].status == .modified) {
+                            // conflict if modified in target
+                            conflict = true;
+                            break;
+                        }
+                    },
+                    .unchanged => {}
+                }
+                i += 1;
+                j += 1;
+            } else if (Object.lessThanFn({}, lca_indexed_objs[i], target_indexed_objs[j])) {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+ 
+        if (conflict) {
+            debug.print("fatal: merge conflicts present\n", .{});
+            index_file.close();
+            return;
+        }
+
+        var merged_objs = try std.ArrayList(Object).initCapacity(allocator, current_indexed_objs.len);
+        defer merged_objs.deinit(allocator);
+        for (current_indexed_objs) |o| {
+            try merged_objs.append(allocator, o);
+        }
+
+        for (target_branch_changes.items) |c| {
+            switch (c.status) {
+                .modified => {
+                    if (sort.binarySearch(Object, merged_objs.items, c.obj2.?.name, Object.compare_obj_to_name)) |idx| {
+                        merged_objs.items[idx] = c.obj2.?;
+                    }
+                },
+                .untracked => {
+                    const insert_pos = for (merged_objs.items, 0..) |o, idx| {
+                        if (!Object.lessThanFn({}, o, c.obj1)) break idx;
+                    } else merged_objs.items.len;
+                    try merged_objs.insert(allocator, insert_pos, c.obj1);
+                },
+                .deleted => {
+                    if (sort.binarySearch(Object, merged_objs.items, c.obj1.name, Object.compare_obj_to_name)) |idx| {
+                        _ = merged_objs.orderedRemove(idx);
+                    }
+                },
+                else => {}
+            }
+        }
+
+        index_file.close();
+        var new_index_file = try vec_dir.createFile(index_file_name, .{});
+        defer new_index_file.close();
+        try write_indexed_objs(index_file, merged_objs.items);
+    } else {
+        index_file.close();
+        var new_index_file = try vec_dir.createFile(index_file_name, .{});
+        defer new_index_file.close();
+        try write_indexed_objs(index_file, target_indexed_objs);
+    }
+
+    const msg = try fmt.allocPrint(allocator, "Merge branch {s} into {s}", .{target_branch, current_branch.?});
+    defer allocator.free(msg);
+
+    try snapshot_index(allocator, cwd, msg);
+
+    debug.print("merged branch {s} into {s}\n", .{target_branch, current_branch.?});
 }

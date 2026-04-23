@@ -13,6 +13,8 @@ A simple version control system written in [zig](https://ziglang.org/), built to
 - Log: Displays the history of commits in the repository
 - Restore: Restore file or directory to previous snapshot version
 - Reset: Reset state of working directory to previous commit
+- Branching: Create or switch to another branch
+- Merge: Merges changes from one branch into the current branch (currently does not support conflict resolution)
 
 ## Planned Features
 - [x] Staging area
@@ -22,10 +24,9 @@ A simple version control system written in [zig](https://ziglang.org/), built to
 - [x] Commit History
     - [x] View commit history
     - [x] Restore working directory to a previous commit snapshot
-- [ ] Stashing changes
-- [ ] Branching
+- [x] Branching
     - [x] Creating and switching branches
-    - [ ] Merging branches
+    - [x] Merging branches
 
 ## Limitations
 - Only works on Linux
